@@ -5,18 +5,20 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{bail, Context, Result};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand, ValueEnum};
-use rand::{distr::Alphanumeric, RngExt};
+use rand::{RngExt, distr::Alphanumeric};
 use reqwest::Client;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
 };
 use url::Url;
+
+mod tidal;
 
 const SPOTIFY_AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
 const SPOTIFY_TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
@@ -48,6 +50,9 @@ enum Command {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+
+    /// Verify TIDAL authentication and catalog access.
+    TidalTest,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -200,6 +205,7 @@ async fn main() -> Result<()> {
         Command::ExportSpotify { playlist, output } => {
             export_spotify_playlist(&playlist, output).await
         }
+        Command::TidalTest => tidal::test_catalog().await,
     }
 }
 
@@ -230,8 +236,7 @@ async fn authenticate_spotify() -> Result<()> {
 
     let code_verifier = random_string(64);
 
-    let code_challenge =
-        URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
+    let code_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
 
     let expected_state = random_string(32);
 
@@ -290,10 +295,7 @@ async fn authenticate_spotify() -> Result<()> {
     Ok(())
 }
 
-async fn export_spotify_playlist(
-    playlist_input: &str,
-    output: Option<PathBuf>,
-) -> Result<()> {
+async fn export_spotify_playlist(playlist_input: &str, output: Option<PathBuf>) -> Result<()> {
     let playlist_id = extract_spotify_playlist_id(playlist_input)?;
     let token = valid_spotify_token().await?;
     let client = Client::new();
@@ -305,9 +307,8 @@ async fn export_spotify_playlist(
 
     println!("Exporting: {}", metadata.name);
 
-    let mut first_page_url = Url::parse(&format!(
-        "{SPOTIFY_API_URL}/playlists/{playlist_id}/items"
-    ))?;
+    let mut first_page_url =
+        Url::parse(&format!("{SPOTIFY_API_URL}/playlists/{playlist_id}/items"))?;
 
     first_page_url
         .query_pairs_mut()
@@ -344,10 +345,7 @@ async fn export_spotify_playlist(
             if item.item_type != "track" {
                 skipped_items.push(SkippedPlaylistItem {
                     position,
-                    reason: format!(
-                        "Unsupported Spotify item type: {}",
-                        item.item_type
-                    ),
+                    reason: format!("Unsupported Spotify item type: {}", item.item_type),
                     title: Some(item.name),
                     spotify_uri: Some(item.uri),
                 });
@@ -361,11 +359,7 @@ async fn export_spotify_playlist(
                 spotify_id: item.id,
                 spotify_uri: item.uri,
                 title: item.name,
-                artists: item
-                    .artists
-                    .into_iter()
-                    .map(|artist| artist.name)
-                    .collect(),
+                artists: item.artists.into_iter().map(|artist| artist.name).collect(),
                 album: item.album.map(|album| album.name),
                 duration_ms: item.duration_ms,
                 isrc: item.external_ids.and_then(|ids| ids.isrc),
@@ -380,8 +374,7 @@ async fn export_spotify_playlist(
 
     let spotify_url = metadata.external_urls.get("spotify").cloned();
 
-    let destination =
-        output.unwrap_or_else(|| default_export_path(&metadata));
+    let destination = output.unwrap_or_else(|| default_export_path(&metadata));
 
     let export = SpotifyPlaylistExport {
         schema_version: 1,
@@ -409,11 +402,7 @@ async fn export_spotify_playlist(
     Ok(())
 }
 
-async fn spotify_get_json<T>(
-    client: &Client,
-    url: &str,
-    access_token: &str,
-) -> Result<T>
+async fn spotify_get_json<T>(client: &Client, url: &str, access_token: &str) -> Result<T>
 where
     T: DeserializeOwned,
 {
@@ -451,22 +440,17 @@ where
             );
         }
 
-        bail!(
-            "Spotify request failed with HTTP {status} for {url}:\n{body}"
-        );
+        bail!("Spotify request failed with HTTP {status} for {url}:\n{body}");
     }
 
-    serde_json::from_str(&body)
-        .with_context(|| format!("Spotify returned invalid JSON for {url}"))
+    serde_json::from_str(&body).with_context(|| format!("Spotify returned invalid JSON for {url}"))
 }
 
 async fn valid_spotify_token() -> Result<StoredSpotifyToken> {
     let token = load_token()?;
     let now = current_unix_timestamp()?;
 
-    let expires_at = token
-        .obtained_at
-        .saturating_add(token.expires_in);
+    let expires_at = token.obtained_at.saturating_add(token.expires_in);
 
     if now < expires_at.saturating_sub(60) {
         return Ok(token);
@@ -475,19 +459,14 @@ async fn valid_spotify_token() -> Result<StoredSpotifyToken> {
     refresh_spotify_token(token).await
 }
 
-async fn refresh_spotify_token(
-    token: StoredSpotifyToken,
-) -> Result<StoredSpotifyToken> {
+async fn refresh_spotify_token(token: StoredSpotifyToken) -> Result<StoredSpotifyToken> {
     let client_id =
         env::var("SPOTIFY_CLIENT_ID").context("SPOTIFY_CLIENT_ID is missing from .env")?;
 
-    let refresh_token = token
-        .refresh_token
-        .clone()
-        .context(
-            "No Spotify refresh token is stored; \
+    let refresh_token = token.refresh_token.clone().context(
+        "No Spotify refresh token is stored; \
              run `cargo run -- auth spotify` again",
-        )?;
+    )?;
 
     let response = Client::new()
         .post(SPOTIFY_TOKEN_URL)
@@ -513,11 +492,8 @@ async fn refresh_spotify_token(
         );
     }
 
-    let refreshed: SpotifyTokenResponse =
-        serde_json::from_str(&response_body)
-            .context(
-                "Spotify returned an invalid refresh-token response",
-            )?;
+    let refreshed: SpotifyTokenResponse = serde_json::from_str(&response_body)
+        .context("Spotify returned an invalid refresh-token response")?;
 
     let updated = StoredSpotifyToken {
         access_token: refreshed.access_token,
@@ -530,9 +506,7 @@ async fn refresh_spotify_token(
             refreshed.scope
         },
 
-        refresh_token: refreshed
-            .refresh_token
-            .or(token.refresh_token),
+        refresh_token: refreshed.refresh_token.or(token.refresh_token),
 
         obtained_at: current_unix_timestamp()?,
     };
@@ -583,15 +557,10 @@ fn validate_playlist_id(id: &str) -> Result<String> {
     Ok(id.to_owned())
 }
 
-fn default_export_path(
-    metadata: &SpotifyPlaylistMetadataResponse,
-) -> PathBuf {
+fn default_export_path(metadata: &SpotifyPlaylistMetadataResponse) -> PathBuf {
     let name = sanitize_filename(&metadata.name);
 
-    PathBuf::from(format!(
-        "data/{name}-{}.json",
-        metadata.id
-    ))
+    PathBuf::from(format!("data/{name}-{}.json", metadata.id))
 }
 
 fn sanitize_filename(value: &str) -> String {
@@ -627,8 +596,7 @@ where
 
     let serialized = serde_json::to_vec_pretty(value)?;
 
-    fs::write(path, serialized)
-        .with_context(|| format!("Could not write {}", path.display()))?;
+    fs::write(path, serialized).with_context(|| format!("Could not write {}", path.display()))?;
 
     Ok(())
 }
@@ -641,8 +609,7 @@ fn load_token() -> Result<StoredSpotifyToken> {
         )
     })?;
 
-    serde_json::from_slice(&bytes)
-        .context("The stored Spotify token file is invalid")
+    serde_json::from_slice(&bytes).context("The stored Spotify token file is invalid")
 }
 
 fn validate_redirect_url(redirect_url: &Url) -> Result<()> {
@@ -679,8 +646,7 @@ async fn wait_for_spotify_callback(
             continue;
         }
 
-        let request =
-            String::from_utf8_lossy(&buffer[..bytes_read]);
+        let request = String::from_utf8_lossy(&buffer[..bytes_read]);
 
         let Some(request_target) = request
             .lines()
@@ -699,29 +665,18 @@ async fn wait_for_spotify_callback(
 
         let callback_url = Url::parse(&format!(
             "http://127.0.0.1:{}{}",
-            redirect_url
-                .port()
-                .context("Missing callback port")?,
+            redirect_url.port().context("Missing callback port")?,
             request_target
         ))?;
 
         // Browsers may request /favicon.ico after loading the callback page.
         if callback_url.path() != redirect_url.path() {
-            send_browser_response(
-                &mut socket,
-                "404 Not Found",
-                "Not found.",
-            )
-            .await?;
+            send_browser_response(&mut socket, "404 Not Found", "Not found.").await?;
 
             continue;
         }
 
-        let parameters: HashMap<String, String> =
-            callback_url
-                .query_pairs()
-                .into_owned()
-                .collect();
+        let parameters: HashMap<String, String> = callback_url.query_pairs().into_owned().collect();
 
         if let Some(error) = parameters.get("error") {
             send_browser_response(
@@ -736,9 +691,7 @@ async fn wait_for_spotify_callback(
 
         let returned_state = parameters
             .get("state")
-            .context(
-                "Spotify callback did not contain state",
-            )?;
+            .context("Spotify callback did not contain state")?;
 
         if returned_state != expected_state {
             send_browser_response(
@@ -753,9 +706,7 @@ async fn wait_for_spotify_callback(
 
         let code = parameters
             .get("code")
-            .context(
-                "Spotify callback did not contain an authorization code",
-            )?
+            .context("Spotify callback did not contain an authorization code")?
             .to_owned();
 
         send_browser_response(
@@ -820,9 +771,7 @@ async fn exchange_authorization_code(
         ])
         .send()
         .await
-        .context(
-            "Could not contact Spotify's token endpoint",
-        )?;
+        .context("Could not contact Spotify's token endpoint")?;
 
     let status = response.status();
     let response_body = response.text().await?;
@@ -835,8 +784,7 @@ async fn exchange_authorization_code(
         );
     }
 
-    serde_json::from_str(&response_body)
-        .context("Spotify returned an invalid token response")
+    serde_json::from_str(&response_body).context("Spotify returned an invalid token response")
 }
 
 fn save_token(token: &StoredSpotifyToken) -> Result<()> {
@@ -853,21 +801,14 @@ fn save_token(token: &StoredSpotifyToken) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
 
-        fs::set_permissions(
-            path,
-            fs::Permissions::from_mode(0o600),
-        )?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     }
 
     Ok(())
 }
 
 fn current_unix_timestamp() -> Result<u64> {
-    Ok(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs(),
-    )
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
 }
 
 fn random_string(length: usize) -> String {

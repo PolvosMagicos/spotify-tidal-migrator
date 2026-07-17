@@ -18,7 +18,15 @@ use tokio::{
 };
 use url::Url;
 
+mod matching;
+mod model;
 mod tidal;
+
+use matching::{failed_match, match_candidates, search_query};
+use model::{
+    ExportedPlaylistMetadata, MatchReport, MatchSummary, SkippedPlaylistItem, SourceTrack,
+    SpotifyPlaylistExport,
+};
 
 const SPOTIFY_AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
 const SPOTIFY_TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
@@ -47,6 +55,20 @@ enum Command {
         playlist: String,
 
         /// Optional destination path.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Match tracks from a Spotify export against the public TIDAL catalog.
+    MatchTidal {
+        /// Spotify playlist export JSON created by export-spotify.
+        input: PathBuf,
+
+        /// Only process the first N exported tracks.
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Optional report destination.
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
@@ -148,49 +170,6 @@ struct SpotifyExternalIds {
     isrc: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct SpotifyPlaylistExport {
-    schema_version: u8,
-    exported_at_unix: u64,
-    playlist: ExportedPlaylistMetadata,
-    tracks: Vec<SourceTrack>,
-    skipped_items: Vec<SkippedPlaylistItem>,
-}
-
-#[derive(Debug, Serialize)]
-struct ExportedPlaylistMetadata {
-    spotify_id: String,
-    name: String,
-    description: Option<String>,
-    spotify_url: Option<String>,
-    snapshot_id: String,
-    total_reported_by_spotify: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct SourceTrack {
-    /// One-based position in the Spotify playlist.
-    position: usize,
-    added_at: Option<String>,
-    spotify_id: Option<String>,
-    spotify_uri: String,
-    title: String,
-    artists: Vec<String>,
-    album: Option<String>,
-    duration_ms: u64,
-    isrc: Option<String>,
-    explicit: bool,
-    is_local: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct SkippedPlaylistItem {
-    position: usize,
-    reason: String,
-    title: Option<String>,
-    spotify_uri: Option<String>,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -205,8 +184,110 @@ async fn main() -> Result<()> {
         Command::ExportSpotify { playlist, output } => {
             export_spotify_playlist(&playlist, output).await
         }
+        Command::MatchTidal {
+            input,
+            limit,
+            output,
+        } => match_tidal_playlist(&input, limit, output).await,
         Command::TidalTest => tidal::test_catalog().await,
     }
+}
+
+async fn match_tidal_playlist(
+    input: &Path,
+    limit: Option<usize>,
+    output: Option<PathBuf>,
+) -> Result<()> {
+    let bytes = fs::read(input)
+        .with_context(|| format!("Could not read Spotify export {}", input.display()))?;
+    let export: SpotifyPlaylistExport = serde_json::from_slice(&bytes)
+        .with_context(|| format!("Invalid Spotify export JSON in {}", input.display()))?;
+
+    if export.schema_version != 1 {
+        bail!(
+            "Unsupported Spotify export schema version {}; expected version 1",
+            export.schema_version
+        );
+    }
+
+    let track_count = limit
+        .unwrap_or(export.tracks.len())
+        .min(export.tracks.len());
+    let destination = output.unwrap_or_else(|| default_match_report_path(input));
+
+    println!("Playlist: {}", export.playlist.name);
+    println!("Tracks selected: {track_count}/{}", export.tracks.len());
+    println!("Authenticating with TIDAL...");
+
+    // Authentication happens exactly once; this client and its bearer token
+    // are reused for every catalog request in the run.
+    let tidal_client = tidal::TidalClient::from_env().await?;
+    println!("TIDAL authentication succeeded.");
+    println!("Country: {}", tidal_client.country_code());
+    println!();
+
+    let mut results = Vec::with_capacity(track_count);
+    let mut summary = MatchSummary::default();
+
+    for (index, track) in export.tracks.iter().take(track_count).enumerate() {
+        let query = search_query(track);
+        print!(
+            "[{}/{}] {} — {} ... ",
+            index + 1,
+            track_count,
+            track.title,
+            track
+                .artists
+                .first()
+                .map_or("Unknown artist", String::as_str)
+        );
+
+        let result = match tidal_client
+            .search_tracks(&track.title, &track.artists)
+            .await
+        {
+            Ok(candidates) => match_candidates(track, query, candidates),
+            Err(error) => failed_match(track, query, format!("{error:#}")),
+        };
+
+        match result.score {
+            Some(score) => println!("{} ({score}/100)", result.status),
+            None => println!("{}", result.status),
+        }
+        if let Some(error) = &result.error {
+            eprintln!("  Search error: {error}");
+        }
+
+        summary.record(result.status);
+        results.push(result);
+
+        if index + 1 < track_count {
+            tokio::time::sleep(tidal::search_delay()).await;
+        }
+    }
+
+    let report = MatchReport {
+        schema_version: 1,
+        generated_at_unix: current_unix_timestamp()?,
+        source_playlist: export.playlist,
+        country_code: tidal_client.country_code().to_owned(),
+        processed_tracks: results.len(),
+        summary,
+        results,
+    };
+
+    write_json(&destination, &report)?;
+
+    println!();
+    println!("Playlist: {}", report.source_playlist.name);
+    println!("Processed: {}", report.processed_tracks);
+    println!("Exact: {}", report.summary.exact);
+    println!("Probable: {}", report.summary.probable);
+    println!("Review: {}", report.summary.review);
+    println!("Missing: {}", report.summary.missing);
+    println!("Saved to: {}", destination.display());
+
+    Ok(())
 }
 
 async fn authenticate_spotify() -> Result<()> {
@@ -561,6 +642,21 @@ fn default_export_path(metadata: &SpotifyPlaylistMetadataResponse) -> PathBuf {
     let name = sanitize_filename(&metadata.name);
 
     PathBuf::from(format!("data/{name}-{}.json", metadata.id))
+}
+
+fn default_match_report_path(input: &Path) -> PathBuf {
+    let stem = input
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("spotify-export");
+    let filename = format!("{stem}-tidal-matches.json");
+
+    input
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("data"))
+        .join(filename)
 }
 
 fn sanitize_filename(value: &str) -> String {

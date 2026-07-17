@@ -1,16 +1,16 @@
 use std::{
     collections::HashMap,
     env, fs,
-    path::Path,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, bail};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use anyhow::{bail, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::{Parser, Subcommand, ValueEnum};
-use rand::{RngExt, distr::Alphanumeric};
+use rand::{distr::Alphanumeric, RngExt};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -20,6 +20,7 @@ use url::Url;
 
 const SPOTIFY_AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
 const SPOTIFY_TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
+const SPOTIFY_API_URL: &str = "https://api.spotify.com/v1";
 const TOKEN_PATH: &str = "data/spotify-token.json";
 
 #[derive(Debug, Parser)]
@@ -36,6 +37,16 @@ enum Command {
     Auth {
         #[arg(value_enum)]
         provider: Provider,
+    },
+
+    /// Export one owned or collaborative Spotify playlist to JSON.
+    ExportSpotify {
+        /// Spotify playlist URL, URI, or raw playlist ID.
+        playlist: String,
+
+        /// Optional destination path.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -66,6 +77,115 @@ struct StoredSpotifyToken {
     obtained_at: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct SpotifyPlaylistMetadataResponse {
+    id: String,
+    name: String,
+
+    #[serde(default)]
+    description: Option<String>,
+
+    snapshot_id: String,
+
+    #[serde(default)]
+    external_urls: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpotifyPlaylistItemsPage {
+    items: Vec<SpotifyPlaylistEntry>,
+    next: Option<String>,
+    total: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpotifyPlaylistEntry {
+    added_at: Option<String>,
+
+    #[serde(default)]
+    is_local: bool,
+
+    item: Option<SpotifyPlaylistItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpotifyPlaylistItem {
+    id: Option<String>,
+    name: String,
+    uri: String,
+    duration_ms: u64,
+
+    #[serde(default)]
+    explicit: bool,
+
+    #[serde(default)]
+    artists: Vec<SpotifyArtist>,
+
+    album: Option<SpotifyAlbum>,
+    external_ids: Option<SpotifyExternalIds>,
+
+    #[serde(rename = "type")]
+    item_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpotifyArtist {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpotifyAlbum {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpotifyExternalIds {
+    isrc: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SpotifyPlaylistExport {
+    schema_version: u8,
+    exported_at_unix: u64,
+    playlist: ExportedPlaylistMetadata,
+    tracks: Vec<SourceTrack>,
+    skipped_items: Vec<SkippedPlaylistItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExportedPlaylistMetadata {
+    spotify_id: String,
+    name: String,
+    description: Option<String>,
+    spotify_url: Option<String>,
+    snapshot_id: String,
+    total_reported_by_spotify: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct SourceTrack {
+    /// One-based position in the Spotify playlist.
+    position: usize,
+    added_at: Option<String>,
+    spotify_id: Option<String>,
+    spotify_uri: String,
+    title: String,
+    artists: Vec<String>,
+    album: Option<String>,
+    duration_ms: u64,
+    isrc: Option<String>,
+    explicit: bool,
+    is_local: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SkippedPlaylistItem {
+    position: usize,
+    reason: String,
+    title: Option<String>,
+    spotify_uri: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -76,6 +196,10 @@ async fn main() -> Result<()> {
         Command::Auth {
             provider: Provider::Spotify,
         } => authenticate_spotify().await,
+
+        Command::ExportSpotify { playlist, output } => {
+            export_spotify_playlist(&playlist, output).await
+        }
     }
 }
 
@@ -105,7 +229,10 @@ async fn authenticate_spotify() -> Result<()> {
         .with_context(|| format!("Could not listen on {host}:{port}"))?;
 
     let code_verifier = random_string(64);
-    let code_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
+
+    let code_challenge =
+        URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
+
     let expected_state = random_string(32);
 
     let scopes = [
@@ -163,6 +290,361 @@ async fn authenticate_spotify() -> Result<()> {
     Ok(())
 }
 
+async fn export_spotify_playlist(
+    playlist_input: &str,
+    output: Option<PathBuf>,
+) -> Result<()> {
+    let playlist_id = extract_spotify_playlist_id(playlist_input)?;
+    let token = valid_spotify_token().await?;
+    let client = Client::new();
+
+    let metadata_url = format!("{SPOTIFY_API_URL}/playlists/{playlist_id}");
+
+    let metadata: SpotifyPlaylistMetadataResponse =
+        spotify_get_json(&client, &metadata_url, &token.access_token).await?;
+
+    println!("Exporting: {}", metadata.name);
+
+    let mut first_page_url = Url::parse(&format!(
+        "{SPOTIFY_API_URL}/playlists/{playlist_id}/items"
+    ))?;
+
+    first_page_url
+        .query_pairs_mut()
+        .append_pair("limit", "50")
+        .append_pair("offset", "0");
+
+    let mut next_url = Some(first_page_url.to_string());
+    let mut tracks = Vec::new();
+    let mut skipped_items = Vec::new();
+    let mut total_reported = 0_usize;
+    let mut processed = 0_usize;
+
+    while let Some(page_url) = next_url {
+        let page: SpotifyPlaylistItemsPage =
+            spotify_get_json(&client, &page_url, &token.access_token).await?;
+
+        total_reported = page.total;
+
+        for entry in page.items {
+            processed += 1;
+            let position = processed;
+
+            let Some(item) = entry.item else {
+                skipped_items.push(SkippedPlaylistItem {
+                    position,
+                    reason: "Spotify returned a null or unavailable item".to_owned(),
+                    title: None,
+                    spotify_uri: None,
+                });
+
+                continue;
+            };
+
+            if item.item_type != "track" {
+                skipped_items.push(SkippedPlaylistItem {
+                    position,
+                    reason: format!(
+                        "Unsupported Spotify item type: {}",
+                        item.item_type
+                    ),
+                    title: Some(item.name),
+                    spotify_uri: Some(item.uri),
+                });
+
+                continue;
+            }
+
+            tracks.push(SourceTrack {
+                position,
+                added_at: entry.added_at,
+                spotify_id: item.id,
+                spotify_uri: item.uri,
+                title: item.name,
+                artists: item
+                    .artists
+                    .into_iter()
+                    .map(|artist| artist.name)
+                    .collect(),
+                album: item.album.map(|album| album.name),
+                duration_ms: item.duration_ms,
+                isrc: item.external_ids.and_then(|ids| ids.isrc),
+                explicit: item.explicit,
+                is_local: entry.is_local,
+            });
+        }
+
+        println!("Processed {processed}/{total_reported} playlist items...");
+        next_url = page.next;
+    }
+
+    let spotify_url = metadata.external_urls.get("spotify").cloned();
+
+    let destination =
+        output.unwrap_or_else(|| default_export_path(&metadata));
+
+    let export = SpotifyPlaylistExport {
+        schema_version: 1,
+        exported_at_unix: current_unix_timestamp()?,
+        playlist: ExportedPlaylistMetadata {
+            spotify_id: metadata.id,
+            name: metadata.name,
+            description: metadata.description,
+            spotify_url,
+            snapshot_id: metadata.snapshot_id,
+            total_reported_by_spotify: total_reported,
+        },
+        tracks,
+        skipped_items,
+    };
+
+    write_json(&destination, &export)?;
+
+    println!();
+    println!("Export completed.");
+    println!("Tracks exported: {}", export.tracks.len());
+    println!("Items skipped: {}", export.skipped_items.len());
+    println!("Saved to: {}", destination.display());
+
+    Ok(())
+}
+
+async fn spotify_get_json<T>(
+    client: &Client,
+    url: &str,
+    access_token: &str,
+) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let response = client
+        .get(url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .with_context(|| format!("Could not contact Spotify: {url}"))?;
+
+    let status = response.status();
+
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+
+    let body = response.text().await?;
+
+    if !status.is_success() {
+        if status.as_u16() == 403 {
+            bail!(
+                "Spotify returned 403 for {url}. \
+                 Make sure you own the playlist or are a collaborator. \
+                 Response: {body}"
+            );
+        }
+
+        if status.as_u16() == 429 {
+            bail!(
+                "Spotify rate-limited the request. \
+                 Retry-After: {} seconds. Response: {body}",
+                retry_after.as_deref().unwrap_or("unknown")
+            );
+        }
+
+        bail!(
+            "Spotify request failed with HTTP {status} for {url}:\n{body}"
+        );
+    }
+
+    serde_json::from_str(&body)
+        .with_context(|| format!("Spotify returned invalid JSON for {url}"))
+}
+
+async fn valid_spotify_token() -> Result<StoredSpotifyToken> {
+    let token = load_token()?;
+    let now = current_unix_timestamp()?;
+
+    let expires_at = token
+        .obtained_at
+        .saturating_add(token.expires_in);
+
+    if now < expires_at.saturating_sub(60) {
+        return Ok(token);
+    }
+
+    refresh_spotify_token(token).await
+}
+
+async fn refresh_spotify_token(
+    token: StoredSpotifyToken,
+) -> Result<StoredSpotifyToken> {
+    let client_id =
+        env::var("SPOTIFY_CLIENT_ID").context("SPOTIFY_CLIENT_ID is missing from .env")?;
+
+    let refresh_token = token
+        .refresh_token
+        .clone()
+        .context(
+            "No Spotify refresh token is stored; \
+             run `cargo run -- auth spotify` again",
+        )?;
+
+    let response = Client::new()
+        .post(SPOTIFY_TOKEN_URL)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token.as_str()),
+            ("client_id", client_id.as_str()),
+        ])
+        .send()
+        .await
+        .context("Could not contact Spotify's token endpoint")?;
+
+    let status = response.status();
+    let response_body = response.text().await?;
+
+    if !status.is_success() {
+        bail!(
+            "Spotify token refresh failed with HTTP {}:\n{}\n\
+             Run `cargo run -- auth spotify` again if the refresh token \
+             is expired or revoked.",
+            status,
+            response_body
+        );
+    }
+
+    let refreshed: SpotifyTokenResponse =
+        serde_json::from_str(&response_body)
+            .context(
+                "Spotify returned an invalid refresh-token response",
+            )?;
+
+    let updated = StoredSpotifyToken {
+        access_token: refreshed.access_token,
+        token_type: refreshed.token_type,
+        expires_in: refreshed.expires_in,
+
+        scope: if refreshed.scope.is_empty() {
+            token.scope
+        } else {
+            refreshed.scope
+        },
+
+        refresh_token: refreshed
+            .refresh_token
+            .or(token.refresh_token),
+
+        obtained_at: current_unix_timestamp()?,
+    };
+
+    save_token(&updated)?;
+    println!("Spotify access token refreshed.");
+
+    Ok(updated)
+}
+
+fn extract_spotify_playlist_id(input: &str) -> Result<String> {
+    let input = input.trim();
+
+    if let Some(id) = input.strip_prefix("spotify:playlist:") {
+        return validate_playlist_id(id);
+    }
+
+    if let Ok(url) = Url::parse(input) {
+        if url.host_str() != Some("open.spotify.com") {
+            bail!("Expected an open.spotify.com playlist URL");
+        }
+
+        let segments: Vec<_> = url
+            .path_segments()
+            .context("Spotify URL has no path")?
+            .collect();
+
+        if segments.len() >= 2 && segments[0] == "playlist" {
+            return validate_playlist_id(segments[1]);
+        }
+
+        bail!("Spotify URL does not contain /playlist/<id>");
+    }
+
+    validate_playlist_id(input)
+}
+
+fn validate_playlist_id(id: &str) -> Result<String> {
+    let valid = !id.is_empty()
+        && id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric());
+
+    if !valid {
+        bail!("Invalid Spotify playlist ID: {id}");
+    }
+
+    Ok(id.to_owned())
+}
+
+fn default_export_path(
+    metadata: &SpotifyPlaylistMetadataResponse,
+) -> PathBuf {
+    let name = sanitize_filename(&metadata.name);
+
+    PathBuf::from(format!(
+        "data/{name}-{}.json",
+        metadata.id
+    ))
+}
+
+fn sanitize_filename(value: &str) -> String {
+    let mut result = String::new();
+    let mut previous_was_separator = false;
+
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            result.push(character.to_ascii_lowercase());
+            previous_was_separator = false;
+        } else if !previous_was_separator {
+            result.push('-');
+            previous_was_separator = true;
+        }
+    }
+
+    let result = result.trim_matches('-');
+
+    if result.is_empty() {
+        "playlist".to_owned()
+    } else {
+        result.to_owned()
+    }
+}
+
+fn write_json<T>(path: &Path, value: &T) -> Result<()>
+where
+    T: Serialize,
+{
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let serialized = serde_json::to_vec_pretty(value)?;
+
+    fs::write(path, serialized)
+        .with_context(|| format!("Could not write {}", path.display()))?;
+
+    Ok(())
+}
+
+fn load_token() -> Result<StoredSpotifyToken> {
+    let bytes = fs::read(TOKEN_PATH).with_context(|| {
+        format!(
+            "Could not read {TOKEN_PATH}; \
+             run `cargo run -- auth spotify` first"
+        )
+    })?;
+
+    serde_json::from_slice(&bytes)
+        .context("The stored Spotify token file is invalid")
+}
+
 fn validate_redirect_url(redirect_url: &Url) -> Result<()> {
     if redirect_url.scheme() != "http" {
         bail!("The local callback must use http");
@@ -197,7 +679,8 @@ async fn wait_for_spotify_callback(
             continue;
         }
 
-        let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+        let request =
+            String::from_utf8_lossy(&buffer[..bytes_read]);
 
         let Some(request_target) = request
             .lines()
@@ -216,17 +699,29 @@ async fn wait_for_spotify_callback(
 
         let callback_url = Url::parse(&format!(
             "http://127.0.0.1:{}{}",
-            redirect_url.port().context("Missing callback port")?,
+            redirect_url
+                .port()
+                .context("Missing callback port")?,
             request_target
         ))?;
 
         // Browsers may request /favicon.ico after loading the callback page.
         if callback_url.path() != redirect_url.path() {
-            send_browser_response(&mut socket, "404 Not Found", "Not found.").await?;
+            send_browser_response(
+                &mut socket,
+                "404 Not Found",
+                "Not found.",
+            )
+            .await?;
+
             continue;
         }
 
-        let parameters: HashMap<String, String> = callback_url.query_pairs().into_owned().collect();
+        let parameters: HashMap<String, String> =
+            callback_url
+                .query_pairs()
+                .into_owned()
+                .collect();
 
         if let Some(error) = parameters.get("error") {
             send_browser_response(
@@ -241,7 +736,9 @@ async fn wait_for_spotify_callback(
 
         let returned_state = parameters
             .get("state")
-            .context("Spotify callback did not contain state")?;
+            .context(
+                "Spotify callback did not contain state",
+            )?;
 
         if returned_state != expected_state {
             send_browser_response(
@@ -256,7 +753,9 @@ async fn wait_for_spotify_callback(
 
         let code = parameters
             .get("code")
-            .context("Spotify callback did not contain an authorization code")?
+            .context(
+                "Spotify callback did not contain an authorization code",
+            )?
             .to_owned();
 
         send_browser_response(
@@ -321,7 +820,9 @@ async fn exchange_authorization_code(
         ])
         .send()
         .await
-        .context("Could not contact Spotify's token endpoint")?;
+        .context(
+            "Could not contact Spotify's token endpoint",
+        )?;
 
     let status = response.status();
     let response_body = response.text().await?;
@@ -334,7 +835,8 @@ async fn exchange_authorization_code(
         );
     }
 
-    serde_json::from_str(&response_body).context("Spotify returned an invalid token response")
+    serde_json::from_str(&response_body)
+        .context("Spotify returned an invalid token response")
 }
 
 fn save_token(token: &StoredSpotifyToken) -> Result<()> {
@@ -351,14 +853,21 @@ fn save_token(token: &StoredSpotifyToken) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
 
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        fs::set_permissions(
+            path,
+            fs::Permissions::from_mode(0o600),
+        )?;
     }
 
     Ok(())
 }
 
 fn current_unix_timestamp() -> Result<u64> {
-    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
+    Ok(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_secs(),
+    )
 }
 
 fn random_string(length: usize) -> String {

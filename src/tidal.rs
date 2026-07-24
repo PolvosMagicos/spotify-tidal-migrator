@@ -8,7 +8,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use reqwest::{Client, StatusCode, header::ACCEPT};
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::time::sleep;
+use tokio::{
+    sync::Mutex,
+    time::{Instant, sleep},
+};
 
 use crate::model::TidalTrackCandidate;
 
@@ -26,6 +29,74 @@ pub struct TidalClient {
     client: Client,
     access_token: String,
     country_code: String,
+    request_gate: RequestGate,
+}
+
+struct RequestGate {
+    state: Mutex<RequestGateState>,
+    base_interval: Duration,
+}
+
+struct RequestGateState {
+    next_start: Instant,
+    interval: Duration,
+    cooldown_until: Option<Instant>,
+}
+
+impl RequestGate {
+    fn new(interval: Duration) -> Self {
+        Self {
+            state: Mutex::new(RequestGateState {
+                next_start: Instant::now(),
+                interval,
+                cooldown_until: None,
+            }),
+            base_interval: interval,
+        }
+    }
+
+    async fn wait_for_slot(&self) {
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+        if state.next_start > now {
+            sleep(state.next_start - now).await;
+        }
+        state.next_start = Instant::now() + state.interval;
+    }
+
+    async fn apply_rate_limit(&self, duration: Duration) -> (Duration, bool) {
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+        let cooldown_end = now + duration;
+        let is_new_incident = state
+            .cooldown_until
+            .is_none_or(|current_cooldown| now >= current_cooldown);
+
+        if cooldown_end > state.next_start {
+            state.next_start = cooldown_end;
+        }
+        state.cooldown_until = Some(
+            state
+                .cooldown_until
+                .map_or(cooldown_end, |current| current.max(cooldown_end)),
+        );
+
+        if is_new_incident {
+            state.interval = state.interval.saturating_mul(2).min(Duration::from_secs(2));
+        }
+
+        (state.interval, is_new_incident)
+    }
+
+    async fn record_success(&self) {
+        let mut state = self.state.lock().await;
+        if state.interval > self.base_interval {
+            state.interval = state
+                .interval
+                .saturating_sub(Duration::from_millis(1))
+                .max(self.base_interval);
+        }
+    }
 }
 
 impl TidalClient {
@@ -50,6 +121,7 @@ impl TidalClient {
             client,
             access_token: token.access_token,
             country_code,
+            request_gate: RequestGate::new(search_interval()),
         })
     }
 
@@ -83,6 +155,7 @@ impl TidalClient {
         let mut last_network_error = None;
 
         for attempt in 1..=MAX_ATTEMPTS {
+            self.request_gate.wait_for_slot().await;
             let response = self
                 .client
                 .get(url.clone())
@@ -113,11 +186,21 @@ impl TidalClient {
                 .context("Could not read the TIDAL catalog response")?;
 
             if status.is_success() {
+                self.request_gate.record_success().await;
                 return parse_search_response(&body);
             }
 
             if status == StatusCode::TOO_MANY_REQUESTS && attempt < MAX_ATTEMPTS {
-                sleep(retry_after.unwrap_or_else(|| retry_backoff(attempt))).await;
+                let cooldown = retry_after.unwrap_or_else(|| retry_backoff(attempt));
+                let (interval, is_new_incident) =
+                    self.request_gate.apply_rate_limit(cooldown).await;
+                if is_new_incident {
+                    eprintln!(
+                        "TIDAL rate limit reached; pausing catalog searches for {} ms and increasing request spacing to {} ms.",
+                        cooldown.as_millis(),
+                        interval.as_millis()
+                    );
+                }
                 continue;
             }
 
@@ -140,11 +223,11 @@ impl TidalClient {
     }
 }
 
-pub fn search_delay() -> Duration {
+fn search_interval() -> Duration {
     let milliseconds = env::var("TIDAL_SEARCH_DELAY_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(300);
+        .unwrap_or(150);
 
     Duration::from_millis(milliseconds)
 }
@@ -401,7 +484,9 @@ fn parse_iso_8601_duration_ms(value: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_duration_ms, parse_search_response};
+    use std::time::Duration;
+
+    use super::{RequestGate, parse_duration_ms, parse_search_response};
     use serde_json::json;
 
     #[test]
@@ -434,5 +519,29 @@ mod tests {
         assert_eq!(candidates[0].duration_ms, Some(201_000));
         assert!(candidates[0].artists.is_empty());
         assert_eq!(candidates[0].album, None);
+    }
+
+    #[tokio::test]
+    async fn coalesces_rate_limits_from_the_same_in_flight_burst() {
+        let gate = RequestGate::new(Duration::from_millis(150));
+
+        assert_eq!(
+            gate.apply_rate_limit(Duration::from_secs(1)).await,
+            (Duration::from_millis(300), true)
+        );
+        assert_eq!(
+            gate.apply_rate_limit(Duration::from_secs(1)).await,
+            (Duration::from_millis(300), false)
+        );
+
+        gate.state.lock().await.cooldown_until = Some(
+            tokio::time::Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .unwrap(),
+        );
+        assert_eq!(
+            gate.apply_rate_limit(Duration::from_secs(1)).await,
+            (Duration::from_millis(600), true)
+        );
     }
 }

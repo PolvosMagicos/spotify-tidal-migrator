@@ -8,6 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand, ValueEnum};
+use futures_util::{StreamExt, stream};
 use inquire::MultiSelect;
 use rand::{RngExt, distr::Alphanumeric};
 use reqwest::Client;
@@ -34,6 +35,8 @@ const SPOTIFY_AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
 const SPOTIFY_TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
 const SPOTIFY_API_URL: &str = "https://api.spotify.com/v1";
 const TOKEN_PATH: &str = "data/spotify-token.json";
+const SPOTIFY_PAGE_LIMIT: usize = 50;
+const SPOTIFY_MAX_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Parser)]
 #[command(name = "spotify-tidal-migrator")]
@@ -59,6 +62,10 @@ enum Command {
         /// Optional destination path.
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Maximum number of simultaneous Spotify page requests.
+        #[arg(long, default_value_t = 4, value_parser = parse_concurrency)]
+        concurrency: usize,
     },
 
     /// Export the current user's Spotify Liked Songs to JSON.
@@ -66,10 +73,18 @@ enum Command {
         /// Optional destination path.
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Maximum number of simultaneous Spotify page requests.
+        #[arg(long, default_value_t = 4, value_parser = parse_concurrency)]
+        concurrency: usize,
     },
 
     /// Select Spotify playlists or Liked Songs for a later migration (read-only).
-    SelectSpotify,
+    SelectSpotify {
+        /// Maximum simultaneous Spotify page and TIDAL catalog requests.
+        #[arg(long, default_value_t = 4, value_parser = parse_concurrency)]
+        concurrency: usize,
+    },
 
     /// Match tracks from a Spotify export against the public TIDAL catalog.
     MatchTidal {
@@ -83,6 +98,10 @@ enum Command {
         /// Optional report destination.
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Maximum number of simultaneous TIDAL catalog searches.
+        #[arg(long, default_value_t = 4, value_parser = parse_concurrency)]
+        concurrency: usize,
     },
 
     /// Verify TIDAL authentication and catalog access.
@@ -134,7 +153,6 @@ struct SpotifyPlaylistMetadataResponse {
 #[derive(Debug, Deserialize)]
 struct SpotifyPlaylistItemsPage {
     items: Vec<SpotifyPlaylistEntry>,
-    next: Option<String>,
     total: usize,
 }
 
@@ -148,7 +166,6 @@ struct SpotifyPlaylistsPage {
 #[derive(Debug, Deserialize)]
 struct SpotifySavedTracksPage {
     items: Vec<SpotifySavedTrackEntry>,
-    next: Option<String>,
     total: usize,
 }
 
@@ -221,6 +238,15 @@ impl std::fmt::Display for SpotifyPlaylistSummary {
 enum SpotifySelectionOption {
     LikedSongs { total: usize },
     Playlist(SpotifyPlaylistSummary),
+}
+
+impl SpotifySelectionOption {
+    fn name(&self) -> &str {
+        match self {
+            Self::LikedSongs { .. } => "Liked Songs",
+            Self::Playlist(playlist) => &playlist.name,
+        }
+    }
 }
 
 impl std::fmt::Display for SpotifySelectionOption {
@@ -307,21 +333,29 @@ async fn main() -> Result<()> {
             provider: Provider::Tidal,
         } => tidal_user::authenticate().await,
 
-        Command::ExportSpotify { playlist, output } => {
-            export_spotify_playlist(&playlist, output).await
-        }
-        Command::ExportSpotifyLiked { output } => export_spotify_liked(output).await,
-        Command::SelectSpotify => select_spotify_playlists().await,
+        Command::ExportSpotify {
+            playlist,
+            output,
+            concurrency,
+        } => export_spotify_playlist(&playlist, output, concurrency)
+            .await
+            .map(|_| ()),
+        Command::ExportSpotifyLiked {
+            output,
+            concurrency,
+        } => export_spotify_liked(output, concurrency).await.map(|_| ()),
+        Command::SelectSpotify { concurrency } => select_spotify_playlists(concurrency).await,
         Command::MatchTidal {
             input,
             limit,
             output,
-        } => match_tidal_playlist(&input, limit, output).await,
+            concurrency,
+        } => match_tidal_playlist(&input, limit, output, concurrency).await,
         Command::TidalTest => tidal::test_catalog().await,
     }
 }
 
-async fn select_spotify_playlists() -> Result<()> {
+async fn select_spotify_playlists(concurrency: usize) -> Result<()> {
     let token = valid_spotify_token().await?;
     let client = Client::new();
     let mut liked_songs_url = Url::parse(&format!("{SPOTIFY_API_URL}/me/tracks"))?;
@@ -374,32 +408,64 @@ async fn select_spotify_playlists() -> Result<()> {
     }
 
     println!();
-    println!("Selected {} source(s):", selected.len());
-    for source in selected {
-        match source {
-            SpotifySelectionOption::LikedSongs { total } => {
-                println!("- Liked Songs — {total} tracks");
-                println!("  https://open.spotify.com/collection/tracks");
-                println!("  cargo run -- export-spotify-liked");
+    let selected_count = selected.len();
+    println!("Selected {selected_count} source(s).");
+    println!("Authenticating with TIDAL for read-only catalog matching...");
+    let tidal_client = tidal::TidalClient::from_env().await?;
+    println!("TIDAL authentication succeeded.");
+
+    let mut summaries = Vec::with_capacity(selected_count);
+    for (index, source) in selected.into_iter().enumerate() {
+        println!();
+        println!("Source {}/{selected_count}", index + 1);
+        println!("Preparing: {}", terminal_safe(source.name()));
+        if let SpotifySelectionOption::Playlist(playlist) = &source {
+            println!("Spotify playlist ID: {}", terminal_safe(&playlist.id));
+            if let Some(url) = playlist.spotify_url() {
+                println!("Spotify URL: {}", terminal_safe(url));
+            }
+        }
+
+        let source_name = source.name().to_owned();
+        let export_result = match source {
+            SpotifySelectionOption::LikedSongs { .. } => {
+                export_spotify_liked(None, concurrency).await
             }
             SpotifySelectionOption::Playlist(playlist) => {
-                println!(
-                    "- {} [{}]",
-                    terminal_safe(&playlist.name),
-                    terminal_safe(&playlist.id)
+                export_spotify_playlist(&playlist.uri, None, concurrency).await
+            }
+        };
+
+        let outcome = match export_result {
+            Ok(export_path) => {
+                match_tidal_playlist_with_client(
+                    &export_path,
+                    None,
+                    None,
+                    &tidal_client,
+                    concurrency,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+
+        match outcome {
+            Ok(summary) => summaries.push(summary),
+            Err(error) => {
+                eprintln!(
+                    "Could not process {}: {error:#}",
+                    terminal_safe(&source_name)
                 );
-                if let Some(url) = playlist.spotify_url() {
-                    println!("  {}", terminal_safe(url));
-                }
-                println!(
-                    "  cargo run -- export-spotify {}",
-                    terminal_safe(&playlist.uri)
-                );
+                summaries.push(SelectionMatchSummary::failed(
+                    source_name,
+                    format!("{error:#}"),
+                ));
             }
         }
     }
 
-    println!();
+    print_selection_match_summary(&summaries);
     println!("No TIDAL import was performed.");
     Ok(())
 }
@@ -416,11 +482,179 @@ fn spotify_selection_options(
     options
 }
 
+#[derive(Debug)]
+struct SelectionMatchSummary {
+    source_name: String,
+    processed: usize,
+    exact: usize,
+    probable: usize,
+    review: usize,
+    missing: usize,
+    errors: usize,
+    report_path: Option<PathBuf>,
+    failure: Option<String>,
+}
+
+impl SelectionMatchSummary {
+    fn matched(&self) -> usize {
+        self.exact + self.probable
+    }
+
+    fn failed(source_name: String, failure: String) -> Self {
+        Self {
+            source_name,
+            processed: 0,
+            exact: 0,
+            probable: 0,
+            review: 0,
+            missing: 0,
+            errors: 0,
+            report_path: None,
+            failure: Some(failure),
+        }
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SelectionMatchTotals {
+    processed: usize,
+    matched: usize,
+    exact: usize,
+    probable: usize,
+    review: usize,
+    missing: usize,
+    errors: usize,
+    failed_sources: usize,
+}
+
+fn selection_match_totals(summaries: &[SelectionMatchSummary]) -> SelectionMatchTotals {
+    let mut totals = SelectionMatchTotals::default();
+
+    for summary in summaries {
+        totals.processed += summary.processed;
+        totals.matched += summary.matched();
+        totals.exact += summary.exact;
+        totals.probable += summary.probable;
+        totals.review += summary.review;
+        totals.missing += summary.missing;
+        totals.errors += summary.errors;
+        totals.failed_sources += usize::from(summary.failure.is_some());
+    }
+
+    totals
+}
+
+fn print_selection_match_summary(summaries: &[SelectionMatchSummary]) {
+    println!();
+    println!("Match summary");
+    println!(
+        "Matched means Exact + Probable; Review remains separate; request errors are included in Missing."
+    );
+
+    for summary in summaries {
+        println!();
+        println!("- {}", terminal_safe(&summary.source_name));
+        if let Some(failure) = &summary.failure {
+            println!("  Failed: {}", terminal_safe(failure));
+            continue;
+        }
+
+        println!(
+            "  Processed: {} | Matched: {} | Exact: {} | Probable: {} | Review: {} | Missing: {} | Errors: {}",
+            summary.processed,
+            summary.matched(),
+            summary.exact,
+            summary.probable,
+            summary.review,
+            summary.missing,
+            summary.errors
+        );
+        if let Some(path) = &summary.report_path {
+            println!("  Report: {}", path.display());
+        }
+    }
+
+    let totals = selection_match_totals(summaries);
+    println!();
+    println!(
+        "Total — Processed: {} | Matched: {} | Exact: {} | Probable: {} | Review: {} | Missing: {} | Errors: {}",
+        totals.processed,
+        totals.matched,
+        totals.exact,
+        totals.probable,
+        totals.review,
+        totals.missing,
+        totals.errors
+    );
+    if totals.failed_sources > 0 {
+        println!(
+            "Sources that could not be processed: {}",
+            totals.failed_sources
+        );
+    }
+    println!();
+}
+
+fn parse_concurrency(value: &str) -> std::result::Result<usize, String> {
+    let concurrency = value
+        .parse::<usize>()
+        .map_err(|_| "concurrency must be an integer from 1 to 16".to_owned())?;
+
+    if !(1..=16).contains(&concurrency) {
+        return Err("concurrency must be from 1 to 16".to_owned());
+    }
+
+    Ok(concurrency)
+}
+
+fn restore_source_order<T>(expected_len: usize, completed: Vec<(usize, T)>) -> Result<Vec<T>> {
+    let mut ordered: Vec<Option<T>> = std::iter::repeat_with(|| None).take(expected_len).collect();
+
+    for (index, value) in completed {
+        let slot = ordered
+            .get_mut(index)
+            .with_context(|| format!("Received an out-of-range match result at index {index}"))?;
+        if slot.replace(value).is_some() {
+            bail!("Received a duplicate match result at index {index}");
+        }
+    }
+
+    ordered
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value.with_context(|| format!("Missing match result for source index {index}"))
+        })
+        .collect()
+}
+
 async fn match_tidal_playlist(
     input: &Path,
     limit: Option<usize>,
     output: Option<PathBuf>,
+    concurrency: usize,
 ) -> Result<()> {
+    println!("Authenticating with TIDAL...");
+
+    // Authentication happens exactly once; this client and its bearer token
+    // are reused for every catalog request in the run.
+    let tidal_client = tidal::TidalClient::from_env().await?;
+    println!("TIDAL authentication succeeded.");
+    println!("Country: {}", tidal_client.country_code());
+    println!();
+
+    match_tidal_playlist_with_client(input, limit, output, &tidal_client, concurrency)
+        .await
+        .map(|_| ())
+}
+
+async fn match_tidal_playlist_with_client(
+    input: &Path,
+    limit: Option<usize>,
+    output: Option<PathBuf>,
+    tidal_client: &tidal::TidalClient,
+    concurrency: usize,
+) -> Result<SelectionMatchSummary> {
     let bytes = fs::read(input)
         .with_context(|| format!("Could not read Spotify export {}", input.display()))?;
     let export: SpotifyPlaylistExport = serde_json::from_slice(&bytes)
@@ -440,53 +674,60 @@ async fn match_tidal_playlist(
 
     println!("Playlist: {}", export.playlist.name);
     println!("Tracks selected: {track_count}/{}", export.tracks.len());
-    println!("Authenticating with TIDAL...");
+    println!("Concurrent TIDAL searches: {concurrency}");
 
-    // Authentication happens exactly once; this client and its bearer token
-    // are reused for every catalog request in the run.
-    let tidal_client = tidal::TidalClient::from_env().await?;
-    println!("TIDAL authentication succeeded.");
-    println!("Country: {}", tidal_client.country_code());
-    println!();
+    let searches = stream::iter(export.tracks.iter().take(track_count).cloned().enumerate())
+        .map(|(index, track)| async move {
+            let query = search_query(&track);
+            let result = match tidal_client
+                .search_tracks(&track.title, &track.artists)
+                .await
+            {
+                Ok(candidates) => match_candidates(&track, query, candidates),
+                Err(error) => failed_match(&track, query, format!("{error:#}")),
+            };
 
-    let mut results = Vec::with_capacity(track_count);
-    let mut summary = MatchSummary::default();
+            (index, result)
+        })
+        .buffer_unordered(concurrency);
+    tokio::pin!(searches);
 
-    for (index, track) in export.tracks.iter().take(track_count).enumerate() {
-        let query = search_query(track);
-        print!(
-            "[{}/{}] {} — {} ... ",
-            index + 1,
-            track_count,
-            track.title,
-            track
-                .artists
-                .first()
-                .map_or("Unknown artist", String::as_str)
-        );
-
-        let result = match tidal_client
-            .search_tracks(&track.title, &track.artists)
-            .await
-        {
-            Ok(candidates) => match_candidates(track, query, candidates),
-            Err(error) => failed_match(track, query, format!("{error:#}")),
-        };
-
+    let mut completed = Vec::with_capacity(track_count);
+    while let Some((index, result)) = searches.next().await {
+        let completed_count = completed.len() + 1;
+        let track = &result.spotify_track;
         match result.score {
-            Some(score) => println!("{} ({score}/100)", result.status),
-            None => println!("{}", result.status),
+            Some(score) => println!(
+                "[{completed_count}/{track_count}] #{} {} — {}: {} ({score}/100)",
+                index + 1,
+                track.title,
+                track
+                    .artists
+                    .first()
+                    .map_or("Unknown artist", String::as_str),
+                result.status
+            ),
+            None => println!(
+                "[{completed_count}/{track_count}] #{} {} — {}: {}",
+                index + 1,
+                track.title,
+                track
+                    .artists
+                    .first()
+                    .map_or("Unknown artist", String::as_str),
+                result.status
+            ),
         }
         if let Some(error) = &result.error {
             eprintln!("  Search error: {error}");
         }
+        completed.push((index, result));
+    }
 
+    let results = restore_source_order(track_count, completed)?;
+    let mut summary = MatchSummary::default();
+    for result in &results {
         summary.record(result.status);
-        results.push(result);
-
-        if index + 1 < track_count {
-            tokio::time::sleep(tidal::search_delay()).await;
-        }
     }
 
     let report = MatchReport {
@@ -510,7 +751,21 @@ async fn match_tidal_playlist(
     println!("Missing: {}", report.summary.missing);
     println!("Saved to: {}", destination.display());
 
-    Ok(())
+    Ok(SelectionMatchSummary {
+        source_name: report.source_playlist.name.clone(),
+        processed: report.processed_tracks,
+        exact: report.summary.exact,
+        probable: report.summary.probable,
+        review: report.summary.review,
+        missing: report.summary.missing,
+        errors: report
+            .results
+            .iter()
+            .filter(|result| result.error.is_some())
+            .count(),
+        report_path: Some(destination),
+        failure: None,
+    })
 }
 
 async fn authenticate_spotify() -> Result<()> {
@@ -599,7 +854,50 @@ async fn authenticate_spotify() -> Result<()> {
     Ok(())
 }
 
-async fn export_spotify_playlist(playlist_input: &str, output: Option<PathBuf>) -> Result<()> {
+fn spotify_offset_page_url(endpoint: &str, offset: usize) -> Result<Url> {
+    let mut url = Url::parse(endpoint)?;
+    url.query_pairs_mut()
+        .append_pair("limit", &SPOTIFY_PAGE_LIMIT.to_string())
+        .append_pair("offset", &offset.to_string());
+    Ok(url)
+}
+
+async fn fetch_remaining_spotify_pages<T>(
+    client: &Client,
+    endpoint: &str,
+    access_token: &str,
+    total: usize,
+    concurrency: usize,
+    item_label: &str,
+) -> Result<Vec<(usize, T)>>
+where
+    T: DeserializeOwned,
+{
+    let requests = stream::iter((SPOTIFY_PAGE_LIMIT..total).step_by(SPOTIFY_PAGE_LIMIT))
+        .map(|offset| async move {
+            let url = spotify_offset_page_url(endpoint, offset)?;
+            let page = spotify_get_json(client, url.as_str(), access_token).await?;
+            Ok::<_, anyhow::Error>((offset, page))
+        })
+        .buffer_unordered(concurrency);
+    tokio::pin!(requests);
+
+    let mut pages = Vec::new();
+    while let Some(page) = requests.next().await {
+        pages.push(page?);
+        let fetched = ((pages.len() + 1) * SPOTIFY_PAGE_LIMIT).min(total);
+        println!("Fetched {fetched}/{total} {item_label}...");
+    }
+
+    pages.sort_unstable_by_key(|(offset, _)| *offset);
+    Ok(pages)
+}
+
+async fn export_spotify_playlist(
+    playlist_input: &str,
+    output: Option<PathBuf>,
+    concurrency: usize,
+) -> Result<PathBuf> {
     let playlist_id = extract_spotify_playlist_id(playlist_input)?;
     let token = valid_spotify_token().await?;
     let client = Client::new();
@@ -611,29 +909,36 @@ async fn export_spotify_playlist(playlist_input: &str, output: Option<PathBuf>) 
 
     println!("Exporting: {}", metadata.name);
 
-    let mut first_page_url =
-        Url::parse(&format!("{SPOTIFY_API_URL}/playlists/{playlist_id}/items"))?;
+    let items_endpoint = format!("{SPOTIFY_API_URL}/playlists/{playlist_id}/items");
+    let first_page_url = spotify_offset_page_url(&items_endpoint, 0)?;
 
-    first_page_url
-        .query_pairs_mut()
-        .append_pair("limit", "50")
-        .append_pair("offset", "0");
-
-    let mut next_url = Some(first_page_url.to_string());
     let mut tracks = Vec::new();
     let mut skipped_items = Vec::new();
-    let mut total_reported = 0_usize;
     let mut processed = 0_usize;
+    let first_page: SpotifyPlaylistItemsPage =
+        spotify_get_json(&client, first_page_url.as_str(), &token.access_token).await?;
+    let total_reported = first_page.total;
+    println!(
+        "Fetched {}/{total_reported} playlist items...",
+        first_page.items.len()
+    );
+    let mut pages = vec![(0, first_page)];
+    pages.extend(
+        fetch_remaining_spotify_pages(
+            &client,
+            &items_endpoint,
+            &token.access_token,
+            total_reported,
+            concurrency,
+            "playlist items",
+        )
+        .await?,
+    );
 
-    while let Some(page_url) = next_url {
-        let page: SpotifyPlaylistItemsPage =
-            spotify_get_json(&client, &page_url, &token.access_token).await?;
-
-        total_reported = page.total;
-
-        for entry in page.items {
+    for (offset, page) in pages {
+        for (page_index, entry) in page.items.into_iter().enumerate() {
             processed += 1;
-            let position = processed;
+            let position = offset + page_index + 1;
 
             let Some(item) = entry.item else {
                 skipped_items.push(SkippedPlaylistItem {
@@ -671,10 +976,8 @@ async fn export_spotify_playlist(playlist_input: &str, output: Option<PathBuf>) 
                 is_local: entry.is_local,
             });
         }
-
-        println!("Processed {processed}/{total_reported} playlist items...");
-        next_url = page.next;
     }
+    println!("Processed {processed}/{total_reported} playlist items.");
 
     let spotify_url = metadata.external_urls.get("spotify").cloned();
 
@@ -703,35 +1006,44 @@ async fn export_spotify_playlist(playlist_input: &str, output: Option<PathBuf>) 
     println!("Items skipped: {}", export.skipped_items.len());
     println!("Saved to: {}", destination.display());
 
-    Ok(())
+    Ok(destination)
 }
 
-async fn export_spotify_liked(output: Option<PathBuf>) -> Result<()> {
+async fn export_spotify_liked(output: Option<PathBuf>, concurrency: usize) -> Result<PathBuf> {
     let token = valid_spotify_token().await?;
     let client = Client::new();
-    let mut first_page_url = Url::parse(&format!("{SPOTIFY_API_URL}/me/tracks"))?;
-    first_page_url
-        .query_pairs_mut()
-        .append_pair("limit", "50")
-        .append_pair("offset", "0");
+    let tracks_endpoint = format!("{SPOTIFY_API_URL}/me/tracks");
+    let first_page_url = spotify_offset_page_url(&tracks_endpoint, 0)?;
 
     println!("Exporting: Liked Songs");
 
-    let mut next_url = Some(first_page_url.to_string());
     let mut tracks = Vec::new();
     let mut skipped_items = Vec::new();
-    let mut total_reported = 0_usize;
     let mut processed = 0_usize;
+    let first_page: SpotifySavedTracksPage =
+        spotify_get_json(&client, first_page_url.as_str(), &token.access_token).await?;
+    let total_reported = first_page.total;
+    println!(
+        "Fetched {}/{total_reported} saved tracks...",
+        first_page.items.len()
+    );
+    let mut pages = vec![(0, first_page)];
+    pages.extend(
+        fetch_remaining_spotify_pages(
+            &client,
+            &tracks_endpoint,
+            &token.access_token,
+            total_reported,
+            concurrency,
+            "saved tracks",
+        )
+        .await?,
+    );
 
-    while let Some(page_url) = next_url {
-        let page: SpotifySavedTracksPage =
-            spotify_get_json(&client, &page_url, &token.access_token).await?;
-
-        total_reported = page.total;
-
-        for entry in page.items {
+    for (offset, page) in pages {
+        for (page_index, entry) in page.items.into_iter().enumerate() {
             processed += 1;
-            let position = processed;
+            let position = offset + page_index + 1;
 
             let Some(track) = entry.track else {
                 skipped_items.push(SkippedPlaylistItem {
@@ -771,10 +1083,8 @@ async fn export_spotify_liked(output: Option<PathBuf>) -> Result<()> {
                 is_local: track.is_local,
             });
         }
-
-        println!("Processed {processed}/{total_reported} saved tracks...");
-        next_url = page.next;
     }
+    println!("Processed {processed}/{total_reported} saved tracks.");
 
     let destination = output.unwrap_or_else(|| PathBuf::from("data/liked-songs.json"));
     let export = SpotifyPlaylistExport {
@@ -802,31 +1112,51 @@ async fn export_spotify_liked(output: Option<PathBuf>) -> Result<()> {
     println!("Items skipped: {}", export.skipped_items.len());
     println!("Saved to: {}", destination.display());
 
-    Ok(())
+    Ok(destination)
 }
 
 async fn spotify_get_json<T>(client: &Client, url: &str, access_token: &str) -> Result<T>
 where
     T: DeserializeOwned,
 {
-    let response = client
-        .get(url)
-        .bearer_auth(access_token)
-        .send()
-        .await
-        .with_context(|| format!("Could not contact Spotify: {url}"))?;
+    for attempt in 1..=SPOTIFY_MAX_ATTEMPTS {
+        let response = client.get(url).bearer_auth(access_token).send().await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error)
+                if attempt < SPOTIFY_MAX_ATTEMPTS && (error.is_timeout() || error.is_connect()) =>
+            {
+                tokio::time::sleep(spotify_retry_delay(attempt, None)).await;
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("Could not contact Spotify: {url}"));
+            }
+        };
 
-    let status = response.status();
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = response.text().await?;
 
-    let retry_after = response
-        .headers()
-        .get("retry-after")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
+        if status.is_success() {
+            return serde_json::from_str(&body)
+                .with_context(|| format!("Spotify returned invalid JSON for {url}"));
+        }
 
-    let body = response.text().await?;
+        if status.as_u16() == 429 && attempt < SPOTIFY_MAX_ATTEMPTS {
+            tokio::time::sleep(spotify_retry_delay(attempt, retry_after.as_deref())).await;
+            continue;
+        }
 
-    if !status.is_success() {
+        if status.is_server_error() && attempt < SPOTIFY_MAX_ATTEMPTS {
+            tokio::time::sleep(spotify_retry_delay(attempt, None)).await;
+            continue;
+        }
+
         if status.as_u16() == 403 {
             bail!(
                 "Spotify returned 403 for {url}. \
@@ -837,7 +1167,7 @@ where
 
         if status.as_u16() == 429 {
             bail!(
-                "Spotify rate-limited the request. \
+                "Spotify rate-limited the request after {SPOTIFY_MAX_ATTEMPTS} attempts. \
                  Retry-After: {} seconds. Response: {body}",
                 retry_after.as_deref().unwrap_or("unknown")
             );
@@ -846,7 +1176,15 @@ where
         bail!("Spotify request failed with HTTP {status} for {url}:\n{body}");
     }
 
-    serde_json::from_str(&body).with_context(|| format!("Spotify returned invalid JSON for {url}"))
+    bail!("Spotify request failed after {SPOTIFY_MAX_ATTEMPTS} attempts")
+}
+
+fn spotify_retry_delay(attempt: usize, retry_after: Option<&str>) -> std::time::Duration {
+    let seconds = retry_after.and_then(|value| value.parse::<u64>().ok());
+    seconds.map_or_else(
+        || std::time::Duration::from_millis(300 * attempt as u64),
+        std::time::Duration::from_secs,
+    )
 }
 
 async fn valid_spotify_token() -> Result<StoredSpotifyToken> {
@@ -1253,8 +1591,9 @@ fn random_string(length: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        SpotifyPlaylistsPage, SpotifySavedTracksPage, SpotifySelectionOption,
-        spotify_selection_options, terminal_safe,
+        SelectionMatchSummary, SelectionMatchTotals, SpotifyPlaylistsPage, SpotifySavedTracksPage,
+        SpotifySelectionOption, parse_concurrency, restore_source_order, selection_match_totals,
+        spotify_offset_page_url, spotify_retry_delay, spotify_selection_options, terminal_safe,
     };
 
     #[test]
@@ -1357,6 +1696,79 @@ mod tests {
         assert_eq!(
             options[0].to_string(),
             "Liked Songs — 42 tracks — saved library"
+        );
+    }
+
+    #[test]
+    fn aggregates_match_summaries_without_counting_review_as_matched() {
+        let summaries = vec![
+            SelectionMatchSummary {
+                source_name: "Indie Perú".to_owned(),
+                processed: 10,
+                exact: 7,
+                probable: 1,
+                review: 1,
+                missing: 1,
+                errors: 0,
+                report_path: None,
+                failure: None,
+            },
+            SelectionMatchSummary::failed(
+                "Unavailable playlist".to_owned(),
+                "Spotify returned HTTP 403".to_owned(),
+            ),
+        ];
+
+        assert_eq!(
+            selection_match_totals(&summaries),
+            SelectionMatchTotals {
+                processed: 10,
+                matched: 8,
+                exact: 7,
+                probable: 1,
+                review: 1,
+                missing: 1,
+                errors: 0,
+                failed_sources: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn restores_concurrent_results_to_source_order() {
+        let ordered = restore_source_order(3, vec![(2, "third"), (0, "first"), (1, "second")])
+            .expect("completion indexes are valid");
+
+        assert_eq!(ordered, vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn validates_match_concurrency_bounds() {
+        assert_eq!(parse_concurrency("1"), Ok(1));
+        assert_eq!(parse_concurrency("16"), Ok(16));
+        assert!(parse_concurrency("0").is_err());
+        assert!(parse_concurrency("17").is_err());
+        assert!(parse_concurrency("many").is_err());
+    }
+
+    #[test]
+    fn builds_spotify_offset_page_urls_safely() {
+        let url = spotify_offset_page_url("https://api.spotify.com/v1/me/tracks", 150).unwrap();
+        let parameters: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+
+        assert_eq!(parameters.get("limit").map(String::as_str), Some("50"));
+        assert_eq!(parameters.get("offset").map(String::as_str), Some("150"));
+    }
+
+    #[test]
+    fn prefers_spotify_retry_after_over_local_backoff() {
+        assert_eq!(
+            spotify_retry_delay(2, Some("7")),
+            std::time::Duration::from_secs(7)
+        );
+        assert_eq!(
+            spotify_retry_delay(2, None),
+            std::time::Duration::from_millis(600)
         );
     }
 

@@ -21,6 +21,7 @@ use url::Url;
 mod matching;
 mod model;
 mod tidal;
+mod tidal_user;
 
 use matching::{failed_match, match_candidates, search_query};
 use model::{
@@ -80,6 +81,7 @@ enum Command {
 #[derive(Debug, Clone, ValueEnum)]
 enum Provider {
     Spotify,
+    Tidal,
 }
 
 #[derive(Debug, Deserialize)]
@@ -180,6 +182,9 @@ async fn main() -> Result<()> {
         Command::Auth {
             provider: Provider::Spotify,
         } => authenticate_spotify().await,
+        Command::Auth {
+            provider: Provider::Tidal,
+        } => tidal_user::authenticate().await,
 
         Command::ExportSpotify { playlist, output } => {
             export_spotify_playlist(&playlist, output).await

@@ -8,6 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand, ValueEnum};
+use inquire::MultiSelect;
 use rand::{RngExt, distr::Alphanumeric};
 use reqwest::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -59,6 +60,16 @@ enum Command {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+
+    /// Export the current user's Spotify Liked Songs to JSON.
+    ExportSpotifyLiked {
+        /// Optional destination path.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Select Spotify playlists or Liked Songs for a later migration (read-only).
+    SelectSpotify,
 
     /// Match tracks from a Spotify export against the public TIDAL catalog.
     MatchTidal {
@@ -128,6 +139,113 @@ struct SpotifyPlaylistItemsPage {
 }
 
 #[derive(Debug, Deserialize)]
+struct SpotifyPlaylistsPage {
+    items: Vec<SpotifyPlaylistSummary>,
+    next: Option<String>,
+    total: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpotifySavedTracksPage {
+    items: Vec<SpotifySavedTrackEntry>,
+    next: Option<String>,
+    total: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpotifySavedTrackEntry {
+    added_at: Option<String>,
+    track: Option<SpotifyPlaylistItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SpotifyPlaylistSummary {
+    id: String,
+    name: String,
+    owner: SpotifyPlaylistOwner,
+    public: Option<bool>,
+
+    #[serde(default)]
+    collaborative: bool,
+
+    uri: String,
+
+    #[serde(default)]
+    external_urls: HashMap<String, String>,
+
+    #[serde(default)]
+    items: Option<SpotifyPlaylistItemCount>,
+
+    #[serde(default)]
+    tracks: Option<SpotifyPlaylistItemCount>,
+}
+
+impl SpotifyPlaylistSummary {
+    fn item_count(&self) -> usize {
+        self.items
+            .as_ref()
+            .or(self.tracks.as_ref())
+            .map_or(0, |items| items.total)
+    }
+
+    fn spotify_url(&self) -> Option<&str> {
+        self.external_urls.get("spotify").map(String::as_str)
+    }
+}
+
+impl std::fmt::Display for SpotifyPlaylistSummary {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let visibility = if self.collaborative {
+            "collaborative"
+        } else {
+            match self.public {
+                Some(true) => "public",
+                Some(false) => "private",
+                None => "visibility unknown",
+            }
+        };
+        let owner = self.owner.display_name.as_deref().unwrap_or(&self.owner.id);
+
+        write!(
+            formatter,
+            "{} — {} — {} items — {}",
+            terminal_safe(&self.name),
+            terminal_safe(owner),
+            self.item_count(),
+            visibility
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+enum SpotifySelectionOption {
+    LikedSongs { total: usize },
+    Playlist(SpotifyPlaylistSummary),
+}
+
+impl std::fmt::Display for SpotifySelectionOption {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LikedSongs { total } => {
+                write!(formatter, "Liked Songs — {total} tracks — saved library")
+            }
+            Self::Playlist(playlist) => playlist.fmt(formatter),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SpotifyPlaylistOwner {
+    id: String,
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SpotifyPlaylistItemCount {
+    total: usize,
+}
+
+#[derive(Debug, Deserialize)]
 struct SpotifyPlaylistEntry {
     added_at: Option<String>,
 
@@ -146,6 +264,9 @@ struct SpotifyPlaylistItem {
 
     #[serde(default)]
     explicit: bool,
+
+    #[serde(default)]
+    is_local: bool,
 
     #[serde(default)]
     artists: Vec<SpotifyArtist>,
@@ -189,6 +310,8 @@ async fn main() -> Result<()> {
         Command::ExportSpotify { playlist, output } => {
             export_spotify_playlist(&playlist, output).await
         }
+        Command::ExportSpotifyLiked { output } => export_spotify_liked(output).await,
+        Command::SelectSpotify => select_spotify_playlists().await,
         Command::MatchTidal {
             input,
             limit,
@@ -196,6 +319,101 @@ async fn main() -> Result<()> {
         } => match_tidal_playlist(&input, limit, output).await,
         Command::TidalTest => tidal::test_catalog().await,
     }
+}
+
+async fn select_spotify_playlists() -> Result<()> {
+    let token = valid_spotify_token().await?;
+    let client = Client::new();
+    let mut liked_songs_url = Url::parse(&format!("{SPOTIFY_API_URL}/me/tracks"))?;
+    liked_songs_url
+        .query_pairs_mut()
+        .append_pair("limit", "1")
+        .append_pair("offset", "0");
+    let mut first_page_url = Url::parse(&format!("{SPOTIFY_API_URL}/me/playlists"))?;
+    first_page_url
+        .query_pairs_mut()
+        .append_pair("limit", "50")
+        .append_pair("offset", "0");
+
+    println!("Fetching Spotify library...");
+    let liked_songs_page: SpotifySavedTracksPage =
+        spotify_get_json(&client, liked_songs_url.as_str(), &token.access_token).await?;
+    let liked_songs_total = liked_songs_page.total;
+
+    println!("Fetching Spotify playlists...");
+    let mut playlists = Vec::new();
+    let mut next_url = Some(first_page_url.to_string());
+
+    while let Some(page_url) = next_url {
+        let page: SpotifyPlaylistsPage =
+            spotify_get_json(&client, &page_url, &token.access_token).await?;
+        let total_reported = page.total;
+        playlists.extend(page.items);
+        println!("Fetched {}/{total_reported} playlists...", playlists.len());
+        next_url = page.next;
+    }
+
+    println!(
+        "Spotify also returns followed playlists. Only playlists you own or collaborate on can be exported; check the owner shown in each option."
+    );
+    let options = spotify_selection_options(liked_songs_total, playlists);
+    let selected = MultiSelect::new("Select Spotify sources to migrate:", options)
+        .with_help_message("Use Space to toggle, Enter to confirm, and Esc to cancel")
+        .with_page_size(15)
+        .prompt_skippable()
+        .context("Could not read the Spotify playlist selection")?;
+
+    let Some(selected) = selected else {
+        println!("Playlist selection cancelled.");
+        return Ok(());
+    };
+
+    if selected.is_empty() {
+        println!("No playlists selected.");
+        return Ok(());
+    }
+
+    println!();
+    println!("Selected {} source(s):", selected.len());
+    for source in selected {
+        match source {
+            SpotifySelectionOption::LikedSongs { total } => {
+                println!("- Liked Songs — {total} tracks");
+                println!("  https://open.spotify.com/collection/tracks");
+                println!("  cargo run -- export-spotify-liked");
+            }
+            SpotifySelectionOption::Playlist(playlist) => {
+                println!(
+                    "- {} [{}]",
+                    terminal_safe(&playlist.name),
+                    terminal_safe(&playlist.id)
+                );
+                if let Some(url) = playlist.spotify_url() {
+                    println!("  {}", terminal_safe(url));
+                }
+                println!(
+                    "  cargo run -- export-spotify {}",
+                    terminal_safe(&playlist.uri)
+                );
+            }
+        }
+    }
+
+    println!();
+    println!("No TIDAL import was performed.");
+    Ok(())
+}
+
+fn spotify_selection_options(
+    liked_songs_total: usize,
+    playlists: Vec<SpotifyPlaylistSummary>,
+) -> Vec<SpotifySelectionOption> {
+    let mut options = Vec::with_capacity(playlists.len() + 1);
+    options.push(SpotifySelectionOption::LikedSongs {
+        total: liked_songs_total,
+    });
+    options.extend(playlists.into_iter().map(SpotifySelectionOption::Playlist));
+    options
 }
 
 async fn match_tidal_playlist(
@@ -488,6 +706,105 @@ async fn export_spotify_playlist(playlist_input: &str, output: Option<PathBuf>) 
     Ok(())
 }
 
+async fn export_spotify_liked(output: Option<PathBuf>) -> Result<()> {
+    let token = valid_spotify_token().await?;
+    let client = Client::new();
+    let mut first_page_url = Url::parse(&format!("{SPOTIFY_API_URL}/me/tracks"))?;
+    first_page_url
+        .query_pairs_mut()
+        .append_pair("limit", "50")
+        .append_pair("offset", "0");
+
+    println!("Exporting: Liked Songs");
+
+    let mut next_url = Some(first_page_url.to_string());
+    let mut tracks = Vec::new();
+    let mut skipped_items = Vec::new();
+    let mut total_reported = 0_usize;
+    let mut processed = 0_usize;
+
+    while let Some(page_url) = next_url {
+        let page: SpotifySavedTracksPage =
+            spotify_get_json(&client, &page_url, &token.access_token).await?;
+
+        total_reported = page.total;
+
+        for entry in page.items {
+            processed += 1;
+            let position = processed;
+
+            let Some(track) = entry.track else {
+                skipped_items.push(SkippedPlaylistItem {
+                    position,
+                    reason: "Spotify returned a null or unavailable saved track".to_owned(),
+                    title: None,
+                    spotify_uri: None,
+                });
+                continue;
+            };
+
+            if track.item_type != "track" {
+                skipped_items.push(SkippedPlaylistItem {
+                    position,
+                    reason: format!("Unsupported Spotify item type: {}", track.item_type),
+                    title: Some(track.name),
+                    spotify_uri: Some(track.uri),
+                });
+                continue;
+            }
+
+            tracks.push(SourceTrack {
+                position,
+                added_at: entry.added_at,
+                spotify_id: track.id,
+                spotify_uri: track.uri,
+                title: track.name,
+                artists: track
+                    .artists
+                    .into_iter()
+                    .map(|artist| artist.name)
+                    .collect(),
+                album: track.album.map(|album| album.name),
+                duration_ms: track.duration_ms,
+                isrc: track.external_ids.and_then(|ids| ids.isrc),
+                explicit: track.explicit,
+                is_local: track.is_local,
+            });
+        }
+
+        println!("Processed {processed}/{total_reported} saved tracks...");
+        next_url = page.next;
+    }
+
+    let destination = output.unwrap_or_else(|| PathBuf::from("data/liked-songs.json"));
+    let export = SpotifyPlaylistExport {
+        schema_version: 1,
+        exported_at_unix: current_unix_timestamp()?,
+        playlist: ExportedPlaylistMetadata {
+            // Saved tracks are a library collection rather than a Spotify playlist,
+            // so Spotify does not provide a playlist ID or snapshot ID for it.
+            spotify_id: "liked-songs".to_owned(),
+            name: "Liked Songs".to_owned(),
+            description: Some("Tracks saved in the Spotify user's library.".to_owned()),
+            spotify_url: Some("https://open.spotify.com/collection/tracks".to_owned()),
+            snapshot_id: "not-available-for-saved-tracks".to_owned(),
+            total_reported_by_spotify: total_reported,
+        },
+        tracks,
+        skipped_items,
+    };
+
+    write_json(&destination, &export)?;
+
+    println!();
+    println!("Export completed.");
+    println!("Tracks exported: {}", export.tracks.len());
+    println!("Items skipped: {}", export.skipped_items.len());
+    println!("Saved to: {}", destination.display());
+
+    Ok(())
+}
+
 async fn spotify_get_json<T>(client: &Client, url: &str, access_token: &str) -> Result<T>
 where
     T: DeserializeOwned,
@@ -685,6 +1002,19 @@ fn sanitize_filename(value: &str) -> String {
     } else {
         result.to_owned()
     }
+}
+
+fn terminal_safe(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 fn write_json<T>(path: &Path, value: &T) -> Result<()>
@@ -918,4 +1248,120 @@ fn random_string(length: usize) -> String {
         .take(length)
         .map(char::from)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        SpotifyPlaylistsPage, SpotifySavedTracksPage, SpotifySelectionOption,
+        spotify_selection_options, terminal_safe,
+    };
+
+    #[test]
+    fn deserializes_current_user_playlists_page() {
+        let json = r#"{
+          "items": [{
+            "id": "playlist123",
+            "name": "Indie Perú",
+            "owner": {"id": "owner1", "display_name": "María"},
+            "public": false,
+            "collaborative": true,
+            "uri": "spotify:playlist:playlist123",
+            "external_urls": {"spotify": "https://open.spotify.com/playlist/playlist123"},
+            "items": {"href": "https://api.spotify.com/v1/playlists/playlist123/items", "total": 12},
+            "tracks": {"href": "https://api.spotify.com/v1/playlists/playlist123/tracks", "total": 99}
+          }],
+          "next": null,
+          "total": 1
+        }"#;
+
+        let page: SpotifyPlaylistsPage = serde_json::from_str(json).unwrap();
+        let playlist = &page.items[0];
+        assert_eq!(page.total, 1);
+        assert_eq!(playlist.name, "Indie Perú");
+        assert_eq!(playlist.item_count(), 12);
+        assert_eq!(
+            playlist.spotify_url(),
+            Some("https://open.spotify.com/playlist/playlist123")
+        );
+        assert!(playlist.to_string().contains("collaborative"));
+    }
+
+    #[test]
+    fn supports_deprecated_tracks_count_as_a_fallback() {
+        let json = r#"{
+          "items": [{
+            "id": "playlist123",
+            "name": "Archivo",
+            "owner": {"id": "owner1", "display_name": null},
+            "public": null,
+            "collaborative": false,
+            "uri": "spotify:playlist:playlist123",
+            "external_urls": {},
+            "tracks": {"total": 7}
+          }],
+          "next": null,
+          "total": 1
+        }"#;
+
+        let page: SpotifyPlaylistsPage = serde_json::from_str(json).unwrap();
+        assert_eq!(page.items[0].item_count(), 7);
+        assert!(page.items[0].to_string().contains("visibility unknown"));
+    }
+
+    #[test]
+    fn deserializes_saved_tracks_page() {
+        let json = r#"{
+          "items": [{
+            "added_at": "2026-07-24T12:00:00Z",
+            "track": {
+              "id": "track123",
+              "name": "¿Para Qué Me Hablas?",
+              "uri": "spotify:track:track123",
+              "duration_ms": 198000,
+              "explicit": false,
+              "is_local": false,
+              "artists": [{"name": "Los Outsaiders"}],
+              "album": {"name": "El Asesino del Rey Peste"},
+              "external_ids": {"isrc": "PE1234567890"},
+              "type": "track"
+            }
+          }],
+          "next": null,
+          "total": 1
+        }"#;
+
+        let page: SpotifySavedTracksPage = serde_json::from_str(json).unwrap();
+        let entry = &page.items[0];
+        let track = entry.track.as_ref().unwrap();
+
+        assert_eq!(page.total, 1);
+        assert_eq!(track.name, "¿Para Qué Me Hablas?");
+        assert_eq!(track.artists[0].name, "Los Outsaiders");
+        assert_eq!(
+            track.external_ids.as_ref().unwrap().isrc.as_deref(),
+            Some("PE1234567890")
+        );
+        assert!(!track.is_local);
+    }
+
+    #[test]
+    fn liked_songs_is_the_first_selection_option() {
+        let options = spotify_selection_options(42, Vec::new());
+
+        assert_eq!(options.len(), 1);
+        assert!(matches!(
+            options.first(),
+            Some(SpotifySelectionOption::LikedSongs { total: 42 })
+        ));
+        assert_eq!(
+            options[0].to_string(),
+            "Liked Songs — 42 tracks — saved library"
+        );
+    }
+
+    #[test]
+    fn removes_terminal_control_characters() {
+        assert_eq!(terminal_safe("Playlist\n\u{1b}[31m"), "Playlist  [31m");
+    }
 }

@@ -217,7 +217,10 @@ playlist without repeating the choice. A cached selection is removed if that
 song is later marked Skip. The review UI prints a complete decision summary and
 requires confirmation before saving. Press Esc during a song prompt to return
 to the previous song; at the first song, Esc cancels without replacing saved
-decisions.
+decisions. The `Enter a TIDAL track ID` option resolves the ID through the
+official `GET /tracks/{id}` endpoint with `countryCode` and
+`include=albums,artists`, displays the returned metadata, and requires a
+separate confirmation before recording it as the manual selection.
 
 Dry run:
 

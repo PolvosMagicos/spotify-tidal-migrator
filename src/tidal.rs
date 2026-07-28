@@ -174,6 +174,40 @@ impl TidalClient {
             .append_pair("countryCode", &self.country_code)
             .append_pair("include", "tracks");
 
+        let body = self.get_catalog_document(url, "search").await?;
+        parse_search_response(&body)
+    }
+
+    pub async fn track_by_id(&self, track_id: &str) -> Result<TidalTrackCandidate> {
+        let track_id = track_id.trim();
+        if track_id.is_empty() || track_id.chars().any(char::is_control) {
+            bail!("TIDAL track ID cannot be empty or contain control characters");
+        }
+
+        let mut url = reqwest::Url::parse(TIDAL_API_URL)?;
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow!("Could not construct the TIDAL track URL"))?;
+            segments.push("tracks");
+            segments.push(track_id);
+        }
+        url.query_pairs_mut()
+            .append_pair("countryCode", &self.country_code)
+            .append_pair("include", "albums,artists");
+
+        let body = self.get_catalog_document(url, "track lookup").await?;
+        let candidate = parse_track_response(&body)?;
+        if candidate.tidal_id != track_id {
+            bail!(
+                "TIDAL returned track ID {} while resolving requested ID {track_id}",
+                candidate.tidal_id
+            );
+        }
+        Ok(candidate)
+    }
+
+    async fn get_catalog_document(&self, url: reqwest::Url, operation: &str) -> Result<String> {
         let mut last_network_error = None;
 
         for attempt in 1..=MAX_ATTEMPTS {
@@ -209,7 +243,7 @@ impl TidalClient {
 
             if status.is_success() {
                 self.request_gate.record_success().await;
-                return parse_search_response(&body);
+                return Ok(body);
             }
 
             if status == StatusCode::TOO_MANY_REQUESTS && attempt < MAX_ATTEMPTS {
@@ -232,7 +266,7 @@ impl TidalClient {
             }
 
             bail!(
-                "TIDAL catalog search failed with HTTP {status}: {}",
+                "TIDAL catalog {operation} failed with HTTP {status}: {}",
                 safe_response_excerpt(&body, &self.access_token)
             );
         }
@@ -240,7 +274,7 @@ impl TidalClient {
         Err(last_network_error
             .map(anyhow::Error::from)
             .unwrap_or_else(|| {
-                anyhow!("TIDAL catalog search failed after {MAX_ATTEMPTS} attempts")
+                anyhow!("TIDAL catalog {operation} failed after {MAX_ATTEMPTS} attempts")
             }))
     }
 }
@@ -396,6 +430,40 @@ fn parse_search_response(body: &str) -> Result<Vec<TidalTrackCandidate>> {
         .collect())
 }
 
+fn parse_track_response(body: &str) -> Result<TidalTrackCandidate> {
+    let document: Value = serde_json::from_str(body).context("TIDAL returned invalid JSON")?;
+    let data = document
+        .get("data")
+        .context("TIDAL track response did not contain data")?;
+    if !data
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("tracks"))
+    {
+        bail!("TIDAL track response returned a non-track resource");
+    }
+
+    let included = document
+        .get("included")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let resources: HashMap<(&str, &str), &Value> = included
+        .iter()
+        .filter_map(|resource| {
+            Some((
+                (
+                    resource.get("type")?.as_str()?,
+                    resource.get("id")?.as_str()?,
+                ),
+                resource,
+            ))
+        })
+        .collect();
+
+    parse_track_resource(data, &resources)
+}
+
 fn parse_track_resource(
     resource: &Value,
     resources: &HashMap<(&str, &str), &Value>,
@@ -540,7 +608,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        RequestGate, parse_duration_ms, parse_rate_limit, parse_search_response, search_interval,
+        RequestGate, parse_duration_ms, parse_rate_limit, parse_search_response,
+        parse_track_response, search_interval,
     };
     use serde_json::json;
 
@@ -574,6 +643,46 @@ mod tests {
         assert_eq!(candidates[0].duration_ms, Some(201_000));
         assert!(candidates[0].artists.is_empty());
         assert_eq!(candidates[0].album, None);
+    }
+
+    #[test]
+    fn parses_single_track_lookup_with_included_artist_and_album() {
+        let response = r#"{
+          "data": {
+            "type": "tracks",
+            "id": "75413016",
+            "attributes": {
+              "title": "Canción elegida",
+              "isrc": "PEABC2600002",
+              "duration": "PT4M2S",
+              "explicit": true
+            },
+            "relationships": {
+              "artists": {"data": [{"type": "artists", "id": "artist-1"}]},
+              "albums": {"data": [{"type": "albums", "id": "album-1"}]}
+            }
+          },
+          "included": [
+            {
+              "type": "artists",
+              "id": "artist-1",
+              "attributes": {"name": "Artista TIDAL"}
+            },
+            {
+              "type": "albums",
+              "id": "album-1",
+              "attributes": {"title": "Álbum TIDAL"}
+            }
+          ]
+        }"#;
+
+        let candidate = parse_track_response(response).unwrap();
+        assert_eq!(candidate.tidal_id, "75413016");
+        assert_eq!(candidate.title, "Canción elegida");
+        assert_eq!(candidate.artists, ["Artista TIDAL"]);
+        assert_eq!(candidate.album.as_deref(), Some("Álbum TIDAL"));
+        assert_eq!(candidate.duration_ms, Some(242_000));
+        assert_eq!(candidate.explicit, Some(true));
     }
 
     #[tokio::test]

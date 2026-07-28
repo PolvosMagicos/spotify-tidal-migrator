@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand, ValueEnum};
 use futures_util::{StreamExt, stream};
-use inquire::{Confirm, MultiSelect, Select};
+use inquire::{Confirm, MultiSelect, Select, Text};
 use rand::{RngExt, distr::Alphanumeric};
 use reqwest::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -505,7 +505,7 @@ async fn main() -> Result<()> {
             .await
         }
         Command::TidalTest => tidal::test_catalog().await,
-        Command::Review { inputs } => review_tracks(&inputs),
+        Command::Review { inputs } => review_tracks(&inputs).await,
         Command::ImportTidal {
             input,
             name,
@@ -591,6 +591,7 @@ async fn migrate_spotify_sources(options: MigrateOptions) -> Result<()> {
     }
 
     if options.include_review {
+        let mut review_tidal_client = None;
         for summary in &summaries {
             if summary.failure.is_some() || summary.review == 0 {
                 continue;
@@ -599,7 +600,7 @@ async fn migrate_spotify_sources(options: MigrateOptions) -> Result<()> {
                 .review_report_path
                 .as_deref()
                 .context("A matched source has no Review report path")?;
-            let outcome = review_one_report(review_path)?;
+            let outcome = review_one_report(review_path, &mut review_tidal_client).await?;
             if outcome.cancelled {
                 bail!(
                     "Migration cancelled during Review; no TIDAL import was started. \
@@ -875,6 +876,7 @@ enum TidalReviewChoice {
         suggested: bool,
         version_conflict: bool,
     },
+    ManualTrackId,
     Skip,
     Finish,
 }
@@ -882,6 +884,12 @@ enum TidalReviewChoice {
 impl std::fmt::Display for TidalReviewChoice {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ManualTrackId => {
+                write!(
+                    formatter,
+                    "Enter a TIDAL track ID — resolve an exact catalog item"
+                )
+            }
             Self::Skip => write!(formatter, "Skip — exclude this track from a future import"),
             Self::Finish => write!(
                 formatter,
@@ -941,7 +949,7 @@ impl std::fmt::Display for TidalReviewChoice {
     }
 }
 
-fn review_tracks(inputs: &[PathBuf]) -> Result<()> {
+async fn review_tracks(inputs: &[PathBuf]) -> Result<()> {
     let available = if inputs.is_empty() {
         discover_review_reports(Path::new("data"))?
     } else {
@@ -984,8 +992,9 @@ fn review_tracks(inputs: &[PathBuf]) -> Result<()> {
 
     let mut reviewed = 0;
     let mut skipped = 0;
+    let mut tidal_client = None;
     for option in selected {
-        let outcome = review_one_report(&option.path)?;
+        let outcome = review_one_report(&option.path, &mut tidal_client).await?;
         reviewed += outcome.selected;
         skipped += outcome.skipped;
         if outcome.cancelled {
@@ -1008,7 +1017,10 @@ struct ReviewSessionOutcome {
     cancelled: bool,
 }
 
-fn review_one_report(path: &Path) -> Result<ReviewSessionOutcome> {
+async fn review_one_report(
+    path: &Path,
+    tidal_client: &mut Option<tidal::TidalClient>,
+) -> Result<ReviewSessionOutcome> {
     let review_report: ReviewReport = read_json(path, "review report")?;
     if review_report.schema_version != 1 {
         bail!(
@@ -1148,13 +1160,21 @@ fn review_one_report(path: &Path) -> Result<ReviewSessionOutcome> {
                 });
             };
 
-            if matches!(selection, TidalReviewChoice::Finish) {
-                stopped_early = true;
-                break;
-            }
-
-            let decision = decision_from_choice(track, selection)
-                .context("A review navigation choice cannot be saved as a track decision")?;
+            let decision = match selection {
+                TidalReviewChoice::Finish => {
+                    stopped_early = true;
+                    break;
+                }
+                TidalReviewChoice::ManualTrackId => {
+                    let Some(candidate) = prompt_manual_tidal_track(track, tidal_client).await?
+                    else {
+                        continue;
+                    };
+                    decision_from_manual_candidate(track, candidate)
+                }
+                choice => decision_from_choice(track, choice)
+                    .context("A review navigation choice cannot be saved as a track decision")?,
+            };
             match decision.action {
                 ReviewDecisionAction::Selected => println!(
                     "Selected TIDAL track {}.",
@@ -1297,7 +1317,7 @@ where
 }
 
 fn tidal_review_choices(result: &MatchResult) -> Vec<TidalReviewChoice> {
-    let mut choices = Vec::with_capacity(result.alternatives.len() + 3);
+    let mut choices = Vec::with_capacity(result.alternatives.len() + 4);
     let mut identifiers = HashSet::new();
 
     if let Some(candidate) = &result.best_candidate {
@@ -1326,6 +1346,7 @@ fn tidal_review_choices(result: &MatchResult) -> Vec<TidalReviewChoice> {
         }
     }
 
+    choices.push(TidalReviewChoice::ManualTrackId);
     choices.push(TidalReviewChoice::Skip);
     choices.push(TidalReviewChoice::Finish);
     choices
@@ -1342,7 +1363,7 @@ fn existing_review_cursor(
     choices
         .iter()
         .position(|choice| match choice {
-            TidalReviewChoice::Finish => false,
+            TidalReviewChoice::ManualTrackId | TidalReviewChoice::Finish => false,
             TidalReviewChoice::Skip => decision.action == ReviewDecisionAction::Skipped,
             TidalReviewChoice::Candidate { candidate, .. } => decision
                 .selected_tidal_candidate
@@ -1365,6 +1386,7 @@ fn decision_from_choice(track: &SourceTrack, choice: TidalReviewChoice) -> Optio
             Some(score),
             Some(candidate),
         ),
+        TidalReviewChoice::ManualTrackId => return None,
         TidalReviewChoice::Skip => (ReviewDecisionAction::Skipped, None, None, None),
         TidalReviewChoice::Finish => return None,
     };
@@ -1380,6 +1402,102 @@ fn decision_from_choice(track: &SourceTrack, choice: TidalReviewChoice) -> Optio
         selected_machine_match_percentage: score,
         selected_tidal_candidate: candidate,
     })
+}
+
+fn decision_from_manual_candidate(
+    track: &SourceTrack,
+    candidate: TidalTrackCandidate,
+) -> ReviewDecision {
+    ReviewDecision {
+        position: track.position,
+        spotify_id: track.spotify_id.clone(),
+        spotify_title: track.title.clone(),
+        spotify_artists: track.artists.clone(),
+        spotify_album: track.album.clone(),
+        action: ReviewDecisionAction::Selected,
+        selected_candidate_rank: None,
+        selected_machine_match_percentage: None,
+        selected_tidal_candidate: Some(candidate),
+    }
+}
+
+async fn prompt_manual_tidal_track(
+    source_track: &SourceTrack,
+    tidal_client: &mut Option<tidal::TidalClient>,
+) -> Result<Option<TidalTrackCandidate>> {
+    let track_id = Text::new("Enter the TIDAL track ID:")
+        .with_help_message("Enter: resolve ID using the official TIDAL catalog | Esc: go back")
+        .prompt_skippable()
+        .context("Could not read the manual TIDAL track ID")?;
+    let Some(track_id) = track_id else {
+        return Ok(None);
+    };
+    let track_id = track_id.trim();
+    if track_id.is_empty() {
+        eprintln!("TIDAL track ID cannot be empty.");
+        return Ok(None);
+    }
+
+    if tidal_client.is_none() {
+        *tidal_client = Some(tidal::TidalClient::from_env().await?);
+    }
+    let candidate = match tidal_client
+        .as_ref()
+        .context("TIDAL catalog client was not initialized")?
+        .track_by_id(track_id)
+        .await
+    {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            eprintln!("Could not resolve TIDAL track ID `{track_id}`: {error}");
+            return Ok(None);
+        }
+    };
+
+    let artists = if candidate.artists.is_empty() {
+        "Unknown artist".to_owned()
+    } else {
+        candidate.artists.join(", ")
+    };
+    println!();
+    println!(
+        "Resolved TIDAL track: {} — {}",
+        terminal_safe(&candidate.title),
+        terminal_safe(&artists)
+    );
+    println!(
+        "Album: {} | Duration: {} | ISRC: {} | {}",
+        terminal_safe(candidate.album.as_deref().unwrap_or("Unknown album")),
+        candidate
+            .duration_ms
+            .map_or_else(|| "unknown".to_owned(), format_duration),
+        terminal_safe(candidate.isrc.as_deref().unwrap_or("no ISRC")),
+        match candidate.explicit {
+            Some(true) => "explicit",
+            Some(false) => "clean",
+            None => "explicitness unknown",
+        }
+    );
+    let source_artists = if source_track.artists.is_empty() {
+        "Unknown artist".to_owned()
+    } else {
+        source_track.artists.join(", ")
+    };
+    let confirmation = format!(
+        "Use TIDAL track {} for Spotify \"{}\" — {}?",
+        terminal_safe(&candidate.tidal_id),
+        terminal_safe(&source_track.title),
+        terminal_safe(&source_artists)
+    );
+    if !Confirm::new(&confirmation)
+        .with_default(false)
+        .prompt()
+        .context("Could not read the manual track confirmation")?
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(candidate))
 }
 
 fn load_existing_review_decisions(
@@ -3093,12 +3211,12 @@ mod tests {
     use super::{
         Cli, Command, SelectionMatchSummary, SelectionMatchTotals, SpotifyPlaylistsPage,
         SpotifySavedTracksPage, SpotifySelectionOption, TidalReviewChoice,
-        apply_cached_review_choices, decision_from_choice, default_review_decisions_path,
-        default_review_report_path, existing_review_cursor, format_duration,
-        merge_unique_candidates, migration_skipped_track_lines, non_exact_track_lines,
-        parse_concurrency, restore_source_order, selection_match_totals, spotify_offset_page_url,
-        spotify_retry_delay, spotify_selection_options, terminal_safe, tidal_review_choices,
-        update_review_choice_cache,
+        apply_cached_review_choices, decision_from_choice, decision_from_manual_candidate,
+        default_review_decisions_path, default_review_report_path, existing_review_cursor,
+        format_duration, merge_unique_candidates, migration_skipped_track_lines,
+        non_exact_track_lines, parse_concurrency, restore_source_order, selection_match_totals,
+        spotify_offset_page_url, spotify_retry_delay, spotify_selection_options, terminal_safe,
+        tidal_review_choices, update_review_choice_cache,
     };
     use crate::model::{
         MatchResult, MatchStatus, ReviewDecisionAction, ScoredCandidate, SourceTrack,
@@ -3371,7 +3489,7 @@ mod tests {
         };
 
         let choices = tidal_review_choices(&result);
-        assert_eq!(choices.len(), 4);
+        assert_eq!(choices.len(), 5);
         let selected_choice = choices[1].clone();
         let decision = decision_from_choice(&source, selected_choice).unwrap();
         assert_eq!(decision.action, ReviewDecisionAction::Selected);
@@ -3387,8 +3505,21 @@ mod tests {
 
         let skip = decision_from_choice(&source, TidalReviewChoice::Skip).unwrap();
         assert_eq!(skip.action, ReviewDecisionAction::Skipped);
-        assert_eq!(existing_review_cursor(&choices, Some(&skip)), 2);
+        assert_eq!(existing_review_cursor(&choices, Some(&skip)), 3);
+        assert!(decision_from_choice(&source, TidalReviewChoice::ManualTrackId).is_none());
         assert!(decision_from_choice(&source, TidalReviewChoice::Finish).is_none());
+
+        let manual = decision_from_manual_candidate(&source, candidate("manual"));
+        assert_eq!(manual.action, ReviewDecisionAction::Selected);
+        assert_eq!(manual.selected_candidate_rank, None);
+        assert_eq!(manual.selected_machine_match_percentage, None);
+        assert_eq!(
+            manual
+                .selected_tidal_candidate
+                .as_ref()
+                .map(|item| item.tidal_id.as_str()),
+            Some("manual")
+        );
     }
 
     #[test]

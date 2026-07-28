@@ -86,6 +86,10 @@ enum Command {
         /// Maximum simultaneous Spotify page and TIDAL catalog requests.
         #[arg(long, default_value_t = 4, value_parser = parse_concurrency)]
         concurrency: usize,
+
+        /// Ignore cached TIDAL searches and replace them with fresh responses.
+        #[arg(long)]
+        refresh_cache: bool,
     },
 
     /// Match tracks from a Spotify export against the public TIDAL catalog.
@@ -104,6 +108,10 @@ enum Command {
         /// Maximum number of simultaneous TIDAL catalog searches.
         #[arg(long, default_value_t = 4, value_parser = parse_concurrency)]
         concurrency: usize,
+
+        /// Ignore cached TIDAL searches and replace them with fresh responses.
+        #[arg(long)]
+        refresh_cache: bool,
     },
 
     /// Verify TIDAL authentication and catalog access.
@@ -346,18 +354,22 @@ async fn main() -> Result<()> {
             output,
             concurrency,
         } => export_spotify_liked(output, concurrency).await.map(|_| ()),
-        Command::SelectSpotify { concurrency } => select_spotify_playlists(concurrency).await,
+        Command::SelectSpotify {
+            concurrency,
+            refresh_cache,
+        } => select_spotify_playlists(concurrency, refresh_cache).await,
         Command::MatchTidal {
             input,
             limit,
             output,
             concurrency,
-        } => match_tidal_playlist(&input, limit, output, concurrency).await,
+            refresh_cache,
+        } => match_tidal_playlist(&input, limit, output, concurrency, refresh_cache).await,
         Command::TidalTest => tidal::test_catalog().await,
     }
 }
 
-async fn select_spotify_playlists(concurrency: usize) -> Result<()> {
+async fn select_spotify_playlists(concurrency: usize, refresh_cache: bool) -> Result<()> {
     let token = valid_spotify_token().await?;
     let client = Client::new();
     let mut liked_songs_url = Url::parse(&format!("{SPOTIFY_API_URL}/me/tracks"))?;
@@ -455,6 +467,7 @@ async fn select_spotify_playlists(concurrency: usize) -> Result<()> {
                     &tidal_client,
                     concurrency,
                     &search_cache,
+                    refresh_cache,
                 )
                 .await
             }
@@ -719,6 +732,7 @@ async fn match_tidal_playlist(
     limit: Option<usize>,
     output: Option<PathBuf>,
     concurrency: usize,
+    refresh_cache: bool,
 ) -> Result<()> {
     println!("Authenticating with TIDAL...");
 
@@ -742,6 +756,7 @@ async fn match_tidal_playlist(
         &tidal_client,
         concurrency,
         &search_cache,
+        refresh_cache,
     )
     .await?;
     print_non_exact_tracks(std::slice::from_ref(&summary));
@@ -755,6 +770,7 @@ async fn match_tidal_playlist_with_client(
     tidal_client: &tidal::TidalClient,
     concurrency: usize,
     search_cache: &TidalSearchCache,
+    refresh_cache: bool,
 ) -> Result<SelectionMatchSummary> {
     let bytes = fs::read(input)
         .with_context(|| format!("Could not read Spotify export {}", input.display()))?;
@@ -776,15 +792,22 @@ async fn match_tidal_playlist_with_client(
     println!("Playlist: {}", export.playlist.name);
     println!("Tracks selected: {track_count}/{}", export.tracks.len());
     println!("Concurrent TIDAL searches: {concurrency}");
+    if refresh_cache {
+        println!("TIDAL cache refresh: enabled");
+    }
 
     let searches = stream::iter(export.tracks.iter().take(track_count).cloned().enumerate())
         .map(|(index, track)| async move {
             let query = search_query(&track);
-            let cached_candidates = match search_cache.get(tidal_client.country_code(), &query) {
-                Ok(candidates) => candidates,
-                Err(error) => {
-                    eprintln!("Could not read the TIDAL search cache: {error:#}");
-                    None
+            let cached_candidates = if refresh_cache {
+                None
+            } else {
+                match search_cache.get(tidal_client.country_code(), &query) {
+                    Ok(candidates) => candidates,
+                    Err(error) => {
+                        eprintln!("Could not read the TIDAL search cache: {error:#}");
+                        None
+                    }
                 }
             };
 
@@ -797,12 +820,23 @@ async fn match_tidal_playlist_with_client(
                     {
                         Ok(candidates) => {
                             if let Ok(timestamp) = current_unix_timestamp()
-                                && let Err(error) = search_cache.insert(
-                                    tidal_client.country_code(),
-                                    &query,
-                                    &candidates,
-                                    timestamp,
-                                )
+                                && let Err(error) = if refresh_cache {
+                                    search_cache.replace(
+                                        tidal_client.country_code(),
+                                        &query,
+                                        &candidates,
+                                        timestamp,
+                                    )
+                                } else {
+                                    search_cache
+                                        .insert(
+                                            tidal_client.country_code(),
+                                            &query,
+                                            &candidates,
+                                            timestamp,
+                                        )
+                                        .map(|_| ())
+                                }
                             {
                                 eprintln!("Could not update the TIDAL search cache: {error:#}");
                             }

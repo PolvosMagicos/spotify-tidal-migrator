@@ -212,11 +212,19 @@ pub async fn run_import(input: &Path, options: ImportCommandOptions) -> Result<(
     }
 
     println!();
-    println!(
-        "This will create one new TIDAL playlist and add {} tracks.",
-        plan.selected_tracks.len()
-    );
-    println!("Existing playlists will not be modified.");
+    if options.resume {
+        println!(
+            "This will resume the saved TIDAL import for {} selected tracks.",
+            plan.selected_tracks.len()
+        );
+        println!("The saved destination playlist will be reused; no new playlist will be created.");
+    } else {
+        println!(
+            "This will create one new TIDAL playlist and add {} tracks.",
+            plan.selected_tracks.len()
+        );
+        println!("Existing playlists will not be modified.");
+    }
 
     if !options.resume && state_path.exists() {
         bail!(

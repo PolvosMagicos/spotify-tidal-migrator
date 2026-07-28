@@ -365,15 +365,38 @@ impl TidalUserClient {
     }
 
     fn resolve_next_url(&self, next: &str) -> Result<Url> {
-        let url = self
-            .api_base_url
-            .join(next)
-            .context("TIDAL returned an invalid pagination URL")?;
+        let url = match Url::parse(next) {
+            Ok(url) => url,
+            Err(url::ParseError::RelativeUrlWithoutBase) => {
+                // TIDAL currently returns links such as `/playlists/...` even
+                // though the public API is rooted at `/v2/`. Treat those as
+                // API-root-relative, while still accepting `/v2/...` links.
+                let base_path = self.api_base_url.path();
+                let relative = if next.starts_with('/') && !next.starts_with(base_path) {
+                    next.trim_start_matches('/')
+                } else {
+                    next
+                };
+                self.api_base_url
+                    .join(relative)
+                    .context("TIDAL returned an invalid pagination URL")?
+            }
+            Err(error) => return Err(error).context("TIDAL returned an invalid pagination URL"),
+        };
         if url.scheme() != self.api_base_url.scheme()
             || url.host_str() != self.api_base_url.host_str()
             || url.port_or_known_default() != self.api_base_url.port_or_known_default()
         {
             bail!("TIDAL returned a pagination URL for an unexpected origin");
+        }
+        let base_path = self.api_base_url.path().trim_end_matches('/');
+        if url.path() != base_path
+            && !url
+                .path()
+                .strip_prefix(base_path)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        {
+            bail!("TIDAL returned a pagination URL outside the public API base path");
         }
         Ok(url)
     }
@@ -1277,7 +1300,7 @@ mod tests {
         let mock = ApiMock::start(vec![
             MockResponse::json(
                 StatusCode::OK,
-                r#"{"data":[{"type":"tracks","id":"track-a"},{"type":"tracks","id":"track-b"}],"links":{"next":"/v2/playlists/playlist-1/relationships/items?page[cursor]=next"}}"#,
+                r#"{"data":[{"type":"tracks","id":"track-a"},{"type":"tracks","id":"track-b"}],"links":{"next":"/playlists/playlist-1/relationships/items?page[cursor]=next"}}"#,
             ),
             MockResponse::json(
                 StatusCode::OK,
@@ -1294,7 +1317,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["track-a", "track-b", "track-a"]
         );
-        assert_eq!(mock.requests.lock().await.len(), 2);
+        let requests = mock.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].path,
+            "/v2/playlists/playlist-1/relationships/items?page[cursor]=next"
+        );
         mock.task.abort();
     }
 

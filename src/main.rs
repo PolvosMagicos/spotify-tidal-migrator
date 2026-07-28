@@ -516,22 +516,21 @@ async fn main() -> Result<()> {
             include_probable,
             resume,
             output,
-        } => {
-            tidal_import::run_import(
-                &input,
-                tidal_import::ImportCommandOptions {
-                    name,
-                    description,
-                    dry_run,
-                    apply,
-                    include_review,
-                    include_probable,
-                    resume,
-                    output,
-                },
-            )
-            .await
-        }
+        } => tidal_import::run_import(
+            &input,
+            tidal_import::ImportCommandOptions {
+                name,
+                description,
+                dry_run,
+                apply,
+                include_review,
+                include_probable,
+                resume,
+                output,
+            },
+        )
+        .await
+        .map(|_| ()),
     }
 }
 
@@ -614,6 +613,7 @@ async fn migrate_spotify_sources(options: MigrateOptions) -> Result<()> {
     println!("Starting TIDAL import stage...");
     let mut imported_sources = 0_usize;
     let mut failed_sources = Vec::new();
+    let mut skipped_tracks = Vec::new();
     for summary in &summaries {
         let Some(match_report) = summary.report_path.as_deref() else {
             if summary.failure.is_some() {
@@ -624,7 +624,7 @@ async fn migrate_spotify_sources(options: MigrateOptions) -> Result<()> {
 
         println!();
         println!("Importing source: {}", terminal_safe(&summary.source_name));
-        tidal_import::run_import(
+        let outcome = tidal_import::run_import(
             match_report,
             tidal_import::ImportCommandOptions {
                 name: None,
@@ -644,6 +644,12 @@ async fn migrate_spotify_sources(options: MigrateOptions) -> Result<()> {
                 terminal_safe(&summary.source_name)
             )
         })?;
+        skipped_tracks.extend(
+            outcome
+                .skipped_tracks
+                .into_iter()
+                .map(|track| (outcome.source_playlist_name.clone(), track)),
+        );
         imported_sources += 1;
     }
 
@@ -652,6 +658,7 @@ async fn migrate_spotify_sources(options: MigrateOptions) -> Result<()> {
         "Full migration flow completed for {imported_sources} source(s) in {} mode.",
         if options.apply { "apply" } else { "dry-run" }
     );
+    print_migration_skipped_tracks(&skipped_tracks);
     if !failed_sources.is_empty() {
         bail!(
             "{} Spotify source(s) failed before import: {}",
@@ -660,6 +667,48 @@ async fn migrate_spotify_sources(options: MigrateOptions) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn print_migration_skipped_tracks(skipped_tracks: &[(String, tidal_import::SkippedImportTrack)]) {
+    println!();
+    if skipped_tracks.is_empty() {
+        println!("Skipped songs: none.");
+        return;
+    }
+
+    println!(
+        "Skipped songs for manual follow-up ({}):",
+        skipped_tracks.len()
+    );
+    for line in migration_skipped_track_lines(skipped_tracks) {
+        println!("  {line}");
+    }
+}
+
+fn migration_skipped_track_lines(
+    skipped_tracks: &[(String, tidal_import::SkippedImportTrack)],
+) -> Vec<String> {
+    skipped_tracks
+        .iter()
+        .map(|(playlist, track)| {
+            let artists = if track.spotify_artists.is_empty() {
+                "Unknown artist".to_owned()
+            } else {
+                track.spotify_artists.join(", ")
+            };
+            let album = track.spotify_album.as_deref().unwrap_or("Unknown album");
+            format!(
+                "[{}] #{} {} — {} | album: {} | {} | {}",
+                terminal_safe(playlist),
+                track.source_position,
+                terminal_safe(&track.spotify_title),
+                terminal_safe(&artists),
+                terminal_safe(album),
+                track.source_match_status,
+                terminal_safe(&track.reason)
+            )
+        })
+        .collect()
 }
 
 async fn prepare_spotify_sources(
@@ -3046,9 +3095,10 @@ mod tests {
         SpotifySavedTracksPage, SpotifySelectionOption, TidalReviewChoice,
         apply_cached_review_choices, decision_from_choice, default_review_decisions_path,
         default_review_report_path, existing_review_cursor, format_duration,
-        merge_unique_candidates, non_exact_track_lines, parse_concurrency, restore_source_order,
-        selection_match_totals, spotify_offset_page_url, spotify_retry_delay,
-        spotify_selection_options, terminal_safe, tidal_review_choices, update_review_choice_cache,
+        merge_unique_candidates, migration_skipped_track_lines, non_exact_track_lines,
+        parse_concurrency, restore_source_order, selection_match_totals, spotify_offset_page_url,
+        spotify_retry_delay, spotify_selection_options, terminal_safe, tidal_review_choices,
+        update_review_choice_cache,
     };
     use crate::model::{
         MatchResult, MatchStatus, ReviewDecisionAction, ScoredCandidate, SourceTrack,
@@ -3455,6 +3505,28 @@ mod tests {
             vec![
                 "#2 Revisar — Artista — Review (70/100)",
                 "#3 Ausente — Artista — Missing (no score)",
+            ]
+        );
+    }
+
+    #[test]
+    fn formats_skipped_songs_with_playlist_metadata_and_reason() {
+        let skipped = vec![(
+            "Qué Rico".to_owned(),
+            crate::tidal_import::SkippedImportTrack {
+                source_position: 15,
+                spotify_title: "Ámame".to_owned(),
+                spotify_artists: vec!["El Gran Combo De Puerto Rico".to_owned()],
+                spotify_album: Some("¡Ámame!".to_owned()),
+                source_match_status: MatchStatus::Missing,
+                reason: "No acceptable TIDAL match".to_owned(),
+            },
+        )];
+
+        assert_eq!(
+            migration_skipped_track_lines(&skipped),
+            [
+                "[Qué Rico] #15 Ámame — El Gran Combo De Puerto Rico | album: ¡Ámame! | Missing | No acceptable TIDAL match"
             ]
         );
     }

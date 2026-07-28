@@ -94,8 +94,21 @@ pub struct SelectedImportTrack {
 pub struct SkippedImportTrack {
     pub source_position: usize,
     pub spotify_title: String,
+
+    #[serde(default)]
+    pub spotify_artists: Vec<String>,
+
+    #[serde(default)]
+    pub spotify_album: Option<String>,
+
     pub source_match_status: MatchStatus,
     pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportRunOutcome {
+    pub source_playlist_name: String,
+    pub skipped_tracks: Vec<SkippedImportTrack>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,7 +185,7 @@ pub struct ImportVerification {
     pub message: String,
 }
 
-pub async fn run_import(input: &Path, options: ImportCommandOptions) -> Result<()> {
+pub async fn run_import(input: &Path, options: ImportCommandOptions) -> Result<ImportRunOutcome> {
     if options.apply && options.dry_run {
         bail!("--apply and --dry-run cannot be used together");
     }
@@ -191,6 +204,10 @@ pub async fn run_import(input: &Path, options: ImportCommandOptions) -> Result<(
         options.include_probable,
         options.include_review,
     )?;
+    let outcome = ImportRunOutcome {
+        source_playlist_name: plan.source.spotify_playlist_name.clone(),
+        skipped_tracks: plan.skipped_tracks.clone(),
+    };
     print_preflight(&plan, !options.apply);
 
     let report_path = options
@@ -205,7 +222,7 @@ pub async fn run_import(input: &Path, options: ImportCommandOptions) -> Result<(
         atomic_write_json(&report_path, &report)?;
         println!("Import plan: {}", report_path.display());
         println!("No TIDAL playlist was created or modified.");
-        return Ok(());
+        return Ok(outcome);
     }
     if plan.selected_tracks.is_empty() {
         bail!("No tracks were selected; refusing to create an empty TIDAL playlist");
@@ -374,7 +391,7 @@ pub async fn run_import(input: &Path, options: ImportCommandOptions) -> Result<(
             println!("Verification succeeded: all tracks are present in source order.");
             println!("Import state: {}", state_path.display());
             println!("Import report: {}", report_path.display());
-            Ok(())
+            Ok(outcome)
         }
         Ok(verification) => {
             let error = anyhow::anyhow!("{}", verification.message);
@@ -440,6 +457,8 @@ fn build_import_plan(
         let skip = |reason: &str| SkippedImportTrack {
             source_position: position,
             spotify_title: result.spotify_track.title.clone(),
+            spotify_artists: result.spotify_track.artists.clone(),
+            spotify_album: result.spotify_track.album.clone(),
             source_match_status: result.status,
             reason: reason.to_owned(),
         };
@@ -860,13 +879,13 @@ async fn verify_import(
     })
 }
 
-fn finish_failed_import(
+fn finish_failed_import<T>(
     error: anyhow::Error,
     state: &mut TidalImportState,
     state_path: &Path,
     report: &mut TidalImportReport,
     report_path: &Path,
-) -> Result<()> {
+) -> Result<T> {
     state.status = ImportStateStatus::Failed;
     state.updated_at_unix = current_unix_timestamp()?;
     atomic_write_json(state_path, state)?;
@@ -1225,6 +1244,14 @@ mod tests {
         assert_eq!(plan.selection.probable_skipped, 1);
         assert_eq!(plan.selection.review_skipped, 1);
         assert_eq!(plan.selection.missing_skipped, 1);
+        let missing = plan
+            .skipped_tracks
+            .iter()
+            .find(|track| track.source_position == 4)
+            .unwrap();
+        assert_eq!(missing.spotify_artists, ["Artista"]);
+        assert_eq!(missing.spotify_album.as_deref(), Some("Álbum"));
+        assert_eq!(missing.reason, "No acceptable TIDAL match");
     }
 
     #[test]
@@ -1407,7 +1434,7 @@ mod tests {
         let output = directory.join("plan.json");
         fs::write(&input, serde_json::to_vec_pretty(&report()).unwrap()).unwrap();
 
-        run_import(
+        let outcome = run_import(
             &input,
             ImportCommandOptions {
                 name: None,
@@ -1423,6 +1450,8 @@ mod tests {
         .await
         .unwrap();
 
+        assert_eq!(outcome.source_playlist_name, "Qué Rico");
+        assert_eq!(outcome.skipped_tracks.len(), 3);
         let plan_report: TidalImportReport =
             serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
         assert!(plan_report.dry_run);

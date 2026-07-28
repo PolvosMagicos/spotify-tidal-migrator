@@ -199,7 +199,9 @@ This selects Spotify playlists or Liked Songs, exports them, matches them,
 optionally runs interactive Review when `--include-review` is supplied, and
 imports each successful source using its original Spotify name. Without
 `--apply`, the entire command stops at import-plan reports and makes no TIDAL
-mutation.
+mutation. At the end, it prints every skipped song across the selected sources
+with its playlist, Spotify position, title, artist, album, match status, and
+selection-policy reason for manual follow-up.
 
 Interactive review can also be run separately:
 

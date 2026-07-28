@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -27,10 +27,10 @@ mod tidal;
 mod tidal_user;
 
 use cache::TidalSearchCache;
-use matching::{failed_match, match_candidates, search_query};
+use matching::{failed_match, fallback_search_queries, match_candidates, search_query};
 use model::{
     ExportedPlaylistMetadata, MatchReport, MatchResult, MatchStatus, MatchSummary,
-    SkippedPlaylistItem, SourceTrack, SpotifyPlaylistExport,
+    SkippedPlaylistItem, SourceTrack, SpotifyPlaylistExport, TidalTrackCandidate,
 };
 
 const SPOTIFY_AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
@@ -94,6 +94,10 @@ enum Command {
         /// Ignore cached TIDAL searches and replace them with fresh responses.
         #[arg(long)]
         refresh_cache: bool,
+
+        /// Retry Review/Missing tracks using cached album-context and title-only searches.
+        #[arg(long)]
+        fallback_searches: bool,
     },
 
     /// Match tracks from a Spotify export against the public TIDAL catalog.
@@ -120,6 +124,10 @@ enum Command {
         /// Ignore cached TIDAL searches and replace them with fresh responses.
         #[arg(long)]
         refresh_cache: bool,
+
+        /// Retry Review/Missing tracks using cached album-context and title-only searches.
+        #[arg(long)]
+        fallback_searches: bool,
     },
 
     /// Verify TIDAL authentication and catalog access.
@@ -366,7 +374,11 @@ async fn main() -> Result<()> {
             concurrency,
             rate_limit,
             refresh_cache,
-        } => select_spotify_playlists(concurrency, rate_limit, refresh_cache).await,
+            fallback_searches,
+        } => {
+            select_spotify_playlists(concurrency, rate_limit, refresh_cache, fallback_searches)
+                .await
+        }
         Command::MatchTidal {
             input,
             limit,
@@ -374,6 +386,7 @@ async fn main() -> Result<()> {
             concurrency,
             rate_limit,
             refresh_cache,
+            fallback_searches,
         } => {
             match_tidal_playlist(
                 &input,
@@ -382,6 +395,7 @@ async fn main() -> Result<()> {
                 concurrency,
                 rate_limit,
                 refresh_cache,
+                fallback_searches,
             )
             .await
         }
@@ -393,6 +407,7 @@ async fn select_spotify_playlists(
     concurrency: usize,
     rate_limit: Option<f64>,
     refresh_cache: bool,
+    fallback_searches: bool,
 ) -> Result<()> {
     let token = valid_spotify_token().await?;
     let client = Client::new();
@@ -490,12 +505,15 @@ async fn select_spotify_playlists(
             Ok(export_path) => {
                 match_tidal_playlist_with_client(
                     &export_path,
-                    None,
-                    None,
                     &tidal_client,
-                    concurrency,
                     &search_cache,
-                    refresh_cache,
+                    MatchRunOptions {
+                        limit: None,
+                        output: None,
+                        concurrency,
+                        refresh_cache,
+                        fallback_searches,
+                    },
                 )
                 .await
             }
@@ -545,6 +563,7 @@ struct SelectionMatchSummary {
     errors: usize,
     cache_hits: usize,
     cache_misses: usize,
+    fallback_queries: usize,
     non_exact_tracks: Vec<String>,
     report_path: Option<PathBuf>,
     failure: Option<String>,
@@ -566,6 +585,7 @@ impl SelectionMatchSummary {
             errors: 0,
             cache_hits: 0,
             cache_misses: 0,
+            fallback_queries: 0,
             non_exact_tracks: Vec::new(),
             report_path: None,
             failure: Some(failure),
@@ -584,6 +604,7 @@ struct SelectionMatchTotals {
     errors: usize,
     cache_hits: usize,
     cache_misses: usize,
+    fallback_queries: usize,
     failed_sources: usize,
 }
 
@@ -600,6 +621,7 @@ fn selection_match_totals(summaries: &[SelectionMatchSummary]) -> SelectionMatch
         totals.errors += summary.errors;
         totals.cache_hits += summary.cache_hits;
         totals.cache_misses += summary.cache_misses;
+        totals.fallback_queries += summary.fallback_queries;
         totals.failed_sources += usize::from(summary.failure.is_some());
     }
 
@@ -688,8 +710,8 @@ fn print_selection_match_summary(summaries: &[SelectionMatchSummary]) {
             summary.errors
         );
         println!(
-            "  Cache hits: {} | Cache misses: {}",
-            summary.cache_hits, summary.cache_misses
+            "  Search cache hits: {} | misses: {} | fallback queries: {}",
+            summary.cache_hits, summary.cache_misses, summary.fallback_queries
         );
         if let Some(path) = &summary.report_path {
             println!("  Report: {}", path.display());
@@ -709,8 +731,8 @@ fn print_selection_match_summary(summaries: &[SelectionMatchSummary]) {
         totals.errors
     );
     println!(
-        "Cache — Hits: {} | Misses: {}",
-        totals.cache_hits, totals.cache_misses
+        "Searches — Cache hits: {} | misses: {} | fallback queries: {}",
+        totals.cache_hits, totals.cache_misses, totals.fallback_queries
     );
     if totals.failed_sources > 0 {
         println!(
@@ -762,6 +784,7 @@ async fn match_tidal_playlist(
     concurrency: usize,
     rate_limit: Option<f64>,
     refresh_cache: bool,
+    fallback_searches: bool,
 ) -> Result<()> {
     println!("Authenticating with TIDAL...");
 
@@ -784,27 +807,192 @@ async fn match_tidal_playlist(
 
     let summary = match_tidal_playlist_with_client(
         input,
-        limit,
-        output,
         &tidal_client,
-        concurrency,
         &search_cache,
-        refresh_cache,
+        MatchRunOptions {
+            limit,
+            output,
+            concurrency,
+            refresh_cache,
+            fallback_searches,
+        },
     )
     .await?;
     print_non_exact_tracks(std::slice::from_ref(&summary));
     Ok(())
 }
 
-async fn match_tidal_playlist_with_client(
-    input: &Path,
-    limit: Option<usize>,
-    output: Option<PathBuf>,
+struct CandidateSearchOutcome {
+    candidates: Vec<TidalTrackCandidate>,
+    cache_hit: bool,
+}
+
+struct TrackSearchOutcome {
+    result: MatchResult,
+    cache_hits: usize,
+    cache_misses: usize,
+    fallback_queries: usize,
+}
+
+async fn cached_tidal_candidates(
+    query: &str,
     tidal_client: &tidal::TidalClient,
-    concurrency: usize,
     search_cache: &TidalSearchCache,
     refresh_cache: bool,
+) -> Result<CandidateSearchOutcome> {
+    if !refresh_cache {
+        match search_cache.get(tidal_client.country_code(), query) {
+            Ok(Some(candidates)) => {
+                return Ok(CandidateSearchOutcome {
+                    candidates,
+                    cache_hit: true,
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("Could not read the TIDAL search cache: {error:#}");
+            }
+        }
+    }
+
+    let candidates = tidal_client.search_tracks_query(query).await?;
+    if let Ok(timestamp) = current_unix_timestamp() {
+        let cache_result = if refresh_cache {
+            search_cache.replace(tidal_client.country_code(), query, &candidates, timestamp)
+        } else {
+            search_cache
+                .insert(tidal_client.country_code(), query, &candidates, timestamp)
+                .map(|_| ())
+        };
+        if let Err(error) = cache_result {
+            eprintln!("Could not update the TIDAL search cache: {error:#}");
+        }
+    }
+
+    Ok(CandidateSearchOutcome {
+        candidates,
+        cache_hit: false,
+    })
+}
+
+fn merge_unique_candidates(
+    candidates: &mut Vec<TidalTrackCandidate>,
+    additional: Vec<TidalTrackCandidate>,
+) {
+    let mut identifiers: HashSet<String> = candidates
+        .iter()
+        .map(|candidate| candidate.tidal_id.clone())
+        .collect();
+    candidates.extend(
+        additional
+            .into_iter()
+            .filter(|candidate| identifiers.insert(candidate.tidal_id.clone())),
+    );
+}
+
+async fn match_track_with_searches(
+    track: SourceTrack,
+    tidal_client: &tidal::TidalClient,
+    search_cache: &TidalSearchCache,
+    refresh_cache: bool,
+    enable_fallbacks: bool,
+) -> TrackSearchOutcome {
+    let primary_query = search_query(&track);
+    let primary =
+        match cached_tidal_candidates(&primary_query, tidal_client, search_cache, refresh_cache)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return TrackSearchOutcome {
+                    result: failed_match(&track, primary_query, format!("{error:#}")),
+                    cache_hits: 0,
+                    cache_misses: 1,
+                    fallback_queries: 0,
+                };
+            }
+        };
+
+    let mut cache_hits = usize::from(primary.cache_hit);
+    let mut cache_misses = usize::from(!primary.cache_hit);
+    let mut candidates = primary.candidates;
+    let mut used_queries = vec![primary_query];
+    let mut result = match_candidates(&track, used_queries[0].clone(), candidates.clone());
+    let mut attempted_fallbacks = 0;
+
+    if enable_fallbacks && matches!(result.status, MatchStatus::Review | MatchStatus::Missing) {
+        for fallback_query in fallback_search_queries(&track) {
+            attempted_fallbacks += 1;
+            let fallback = match cached_tidal_candidates(
+                &fallback_query,
+                tidal_client,
+                search_cache,
+                refresh_cache,
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    cache_misses += 1;
+                    eprintln!(
+                        "Fallback search failed for {} — {}: {error:#}",
+                        terminal_safe(&track.title),
+                        terminal_safe(
+                            track
+                                .artists
+                                .first()
+                                .map_or("Unknown artist", String::as_str)
+                        )
+                    );
+                    continue;
+                }
+            };
+
+            cache_hits += usize::from(fallback.cache_hit);
+            cache_misses += usize::from(!fallback.cache_hit);
+            merge_unique_candidates(&mut candidates, fallback.candidates);
+            used_queries.push(fallback_query);
+            result = match_candidates(
+                &track,
+                used_queries.join(" | fallback: "),
+                candidates.clone(),
+            );
+
+            if matches!(result.status, MatchStatus::Exact | MatchStatus::Probable) {
+                break;
+            }
+        }
+    }
+
+    TrackSearchOutcome {
+        result,
+        cache_hits,
+        cache_misses,
+        fallback_queries: attempted_fallbacks,
+    }
+}
+
+struct MatchRunOptions {
+    limit: Option<usize>,
+    output: Option<PathBuf>,
+    concurrency: usize,
+    refresh_cache: bool,
+    fallback_searches: bool,
+}
+
+async fn match_tidal_playlist_with_client(
+    input: &Path,
+    tidal_client: &tidal::TidalClient,
+    search_cache: &TidalSearchCache,
+    options: MatchRunOptions,
 ) -> Result<SelectionMatchSummary> {
+    let MatchRunOptions {
+        limit,
+        output,
+        concurrency,
+        refresh_cache,
+        fallback_searches,
+    } = options;
     let bytes = fs::read(input)
         .with_context(|| format!("Could not read Spotify export {}", input.display()))?;
     let export: SpotifyPlaylistExport = serde_json::from_slice(&bytes)
@@ -828,60 +1016,23 @@ async fn match_tidal_playlist_with_client(
     if refresh_cache {
         println!("TIDAL cache refresh: enabled");
     }
+    if fallback_searches {
+        println!("Fallback searches: enabled for Review/Missing tracks");
+    }
 
     let searches = stream::iter(export.tracks.iter().take(track_count).cloned().enumerate())
         .map(|(index, track)| async move {
-            let query = search_query(&track);
-            let cached_candidates = if refresh_cache {
-                None
-            } else {
-                match search_cache.get(tidal_client.country_code(), &query) {
-                    Ok(candidates) => candidates,
-                    Err(error) => {
-                        eprintln!("Could not read the TIDAL search cache: {error:#}");
-                        None
-                    }
-                }
-            };
-
-            let (result, cache_hit) = match cached_candidates {
-                Some(candidates) => (match_candidates(&track, query, candidates), true),
-                None => {
-                    let result = match tidal_client
-                        .search_tracks(&track.title, &track.artists)
-                        .await
-                    {
-                        Ok(candidates) => {
-                            if let Ok(timestamp) = current_unix_timestamp()
-                                && let Err(error) = if refresh_cache {
-                                    search_cache.replace(
-                                        tidal_client.country_code(),
-                                        &query,
-                                        &candidates,
-                                        timestamp,
-                                    )
-                                } else {
-                                    search_cache
-                                        .insert(
-                                            tidal_client.country_code(),
-                                            &query,
-                                            &candidates,
-                                            timestamp,
-                                        )
-                                        .map(|_| ())
-                                }
-                            {
-                                eprintln!("Could not update the TIDAL search cache: {error:#}");
-                            }
-                            match_candidates(&track, query, candidates)
-                        }
-                        Err(error) => failed_match(&track, query, format!("{error:#}")),
-                    };
-                    (result, false)
-                }
-            };
-
-            (index, result, cache_hit)
+            (
+                index,
+                match_track_with_searches(
+                    track,
+                    tidal_client,
+                    search_cache,
+                    refresh_cache,
+                    fallback_searches,
+                )
+                .await,
+            )
         })
         .buffer_unordered(concurrency);
     tokio::pin!(searches);
@@ -889,18 +1040,29 @@ async fn match_tidal_playlist_with_client(
     let mut completed = Vec::with_capacity(track_count);
     let mut cache_hits = 0_usize;
     let mut cache_misses = 0_usize;
-    while let Some((index, result, cache_hit)) = searches.next().await {
-        if cache_hit {
-            cache_hits += 1;
-        } else {
-            cache_misses += 1;
-        }
+    let mut fallback_queries = 0_usize;
+    while let Some((index, outcome)) = searches.next().await {
+        cache_hits += outcome.cache_hits;
+        cache_misses += outcome.cache_misses;
+        fallback_queries += outcome.fallback_queries;
+        let result = outcome.result;
         let completed_count = completed.len() + 1;
         let track = &result.spotify_track;
-        let cache_marker = if cache_hit { " [cache]" } else { "" };
+        let cache_marker = if outcome.cache_misses == 0 {
+            " [cache]"
+        } else if outcome.cache_hits > 0 {
+            " [cache+network]"
+        } else {
+            ""
+        };
+        let fallback_marker = if outcome.fallback_queries > 0 {
+            format!(" [fallback {}]", outcome.fallback_queries)
+        } else {
+            String::new()
+        };
         match result.score {
             Some(score) => println!(
-                "[{completed_count}/{track_count}] #{} {} — {}: {} ({score}/100){cache_marker}",
+                "[{completed_count}/{track_count}] #{} {} — {}: {} ({score}/100){cache_marker}{fallback_marker}",
                 index + 1,
                 track.title,
                 track
@@ -910,7 +1072,7 @@ async fn match_tidal_playlist_with_client(
                 result.status
             ),
             None => println!(
-                "[{completed_count}/{track_count}] #{} {} — {}: {}{cache_marker}",
+                "[{completed_count}/{track_count}] #{} {} — {}: {}{cache_marker}{fallback_marker}",
                 index + 1,
                 track.title,
                 track
@@ -951,8 +1113,9 @@ async fn match_tidal_playlist_with_client(
     println!("Probable: {}", report.summary.probable);
     println!("Review: {}", report.summary.review);
     println!("Missing: {}", report.summary.missing);
-    println!("Cache hits: {cache_hits}");
-    println!("Cache misses: {cache_misses}");
+    println!("Search cache hits: {cache_hits}");
+    println!("Search cache misses: {cache_misses}");
+    println!("Fallback queries: {fallback_queries}");
     println!("Saved to: {}", destination.display());
 
     Ok(SelectionMatchSummary {
@@ -969,6 +1132,7 @@ async fn match_tidal_playlist_with_client(
             .count(),
         cache_hits,
         cache_misses,
+        fallback_queries,
         non_exact_tracks: non_exact_track_lines(&report.results),
         report_path: Some(destination),
         failure: None,
@@ -1799,11 +1963,11 @@ fn random_string(length: usize) -> String {
 mod tests {
     use super::{
         SelectionMatchSummary, SelectionMatchTotals, SpotifyPlaylistsPage, SpotifySavedTracksPage,
-        SpotifySelectionOption, non_exact_track_lines, parse_concurrency, restore_source_order,
-        selection_match_totals, spotify_offset_page_url, spotify_retry_delay,
+        SpotifySelectionOption, merge_unique_candidates, non_exact_track_lines, parse_concurrency,
+        restore_source_order, selection_match_totals, spotify_offset_page_url, spotify_retry_delay,
         spotify_selection_options, terminal_safe,
     };
-    use crate::model::{MatchResult, MatchStatus, SourceTrack};
+    use crate::model::{MatchResult, MatchStatus, SourceTrack, TidalTrackCandidate};
 
     #[test]
     fn deserializes_current_user_playlists_page() {
@@ -1921,6 +2085,7 @@ mod tests {
                 errors: 0,
                 cache_hits: 6,
                 cache_misses: 4,
+                fallback_queries: 2,
                 non_exact_tracks: Vec::new(),
                 report_path: None,
                 failure: None,
@@ -1943,9 +2108,34 @@ mod tests {
                 errors: 0,
                 cache_hits: 6,
                 cache_misses: 4,
+                fallback_queries: 2,
                 failed_sources: 1,
             }
         );
+    }
+
+    #[test]
+    fn merges_fallback_candidates_without_duplicate_tidal_ids() {
+        let candidate = |tidal_id: &str, title: &str| TidalTrackCandidate {
+            tidal_id: tidal_id.to_owned(),
+            title: title.to_owned(),
+            version: None,
+            isrc: None,
+            duration_ms: None,
+            explicit: None,
+            artists: Vec::new(),
+            album: None,
+        };
+        let mut candidates = vec![candidate("1", "Primary")];
+
+        merge_unique_candidates(
+            &mut candidates,
+            vec![candidate("1", "Duplicate"), candidate("2", "Fallback")],
+        );
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].title, "Primary");
+        assert_eq!(candidates[1].tidal_id, "2");
     }
 
     #[test]

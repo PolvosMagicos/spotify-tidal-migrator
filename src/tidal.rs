@@ -157,6 +157,10 @@ impl TidalClient {
             _ => title.to_owned(),
         };
 
+        self.search_tracks_query(&query).await
+    }
+
+    pub async fn search_tracks_query(&self, query: &str) -> Result<Vec<TidalTrackCandidate>> {
         let mut url = reqwest::Url::parse(TIDAL_API_URL)?;
         {
             let mut segments = url
@@ -164,7 +168,7 @@ impl TidalClient {
                 .map_err(|_| anyhow!("Could not construct the TIDAL search URL"))?;
             // This public endpoint is case-sensitive.
             segments.push("searchResults");
-            segments.push(&query);
+            segments.push(query);
         }
         url.query_pairs_mut()
             .append_pair("countryCode", &self.country_code)

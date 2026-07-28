@@ -20,6 +20,38 @@ pub fn search_query(track: &SourceTrack) -> String {
     }
 }
 
+pub fn fallback_search_queries(track: &SourceTrack) -> Vec<String> {
+    let title = track.title.trim();
+    if title.is_empty() {
+        return Vec::new();
+    }
+
+    let primary_artist = track
+        .artists
+        .first()
+        .map(|artist| artist.trim())
+        .filter(|artist| !artist.is_empty());
+    let mut queries = Vec::with_capacity(2);
+
+    if let Some(album) = track.album.as_deref().map(str::trim)
+        && !album.is_empty()
+    {
+        let album_query = match primary_artist {
+            Some(artist) => format!("{title} {artist} {album}"),
+            None => format!("{title} {album}"),
+        };
+        if album_query != search_query(track) {
+            queries.push(album_query);
+        }
+    }
+
+    if title != search_query(track) && !queries.iter().any(|query| query == title) {
+        queries.push(title.to_owned());
+    }
+
+    queries
+}
+
 pub fn match_candidates(
     track: &SourceTrack,
     query: String,
@@ -284,7 +316,9 @@ fn version_indicators(value: &str) -> BTreeSet<&'static str> {
 mod tests {
     use crate::model::{MatchStatus, SourceTrack, TidalTrackCandidate};
 
-    use super::{classify, duration_score, score_candidate, version_conflict};
+    use super::{
+        classify, duration_score, fallback_search_queries, score_candidate, version_conflict,
+    };
 
     fn source() -> SourceTrack {
         SourceTrack {
@@ -340,6 +374,21 @@ mod tests {
             classify(scored.score, scored.version_conflict, false),
             MatchStatus::Exact
         );
+    }
+
+    #[test]
+    fn builds_album_and_title_fallback_queries() {
+        let mut track = source();
+        track.title = "¿Para Qué Me Hablas?".to_owned();
+        assert_eq!(
+            fallback_search_queries(&track),
+            vec!["¿Para Qué Me Hablas? Artista Álbum", "¿Para Qué Me Hablas?"]
+        );
+
+        let mut title_only = track;
+        title_only.artists.clear();
+        title_only.album = None;
+        assert!(fallback_search_queries(&title_only).is_empty());
     }
 
     #[test]

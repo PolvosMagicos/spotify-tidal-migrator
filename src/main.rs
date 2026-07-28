@@ -24,6 +24,7 @@ mod cache;
 mod matching;
 mod model;
 mod tidal;
+mod tidal_import;
 mod tidal_user;
 
 use cache::TidalSearchCache;
@@ -138,6 +139,44 @@ enum Command {
     Review {
         /// Optional review-report paths; omit to select reports discovered under data/.
         inputs: Vec<PathBuf>,
+    },
+
+    /// Validate or apply a TIDAL playlist import from a match report.
+    ImportTidal {
+        /// Match-report JSON created by match-tidal.
+        input: PathBuf,
+
+        /// Override the source Spotify playlist name.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Override the destination playlist description.
+        #[arg(long)]
+        description: Option<String>,
+
+        /// Validate and write an import plan without mutating TIDAL.
+        #[arg(long, conflicts_with = "apply")]
+        dry_run: bool,
+
+        /// Explicitly create and populate one new TIDAL playlist.
+        #[arg(long, conflicts_with = "dry_run")]
+        apply: bool,
+
+        /// Include manually selected Review decisions.
+        #[arg(long)]
+        include_review: bool,
+
+        /// Include matches classified as Probable.
+        #[arg(long)]
+        include_probable: bool,
+
+        /// Resume a compatible partially completed import.
+        #[arg(long, requires = "apply")]
+        resume: bool,
+
+        /// Optional import report destination.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -408,6 +447,32 @@ async fn main() -> Result<()> {
         }
         Command::TidalTest => tidal::test_catalog().await,
         Command::Review { inputs } => review_tracks(&inputs),
+        Command::ImportTidal {
+            input,
+            name,
+            description,
+            dry_run,
+            apply,
+            include_review,
+            include_probable,
+            resume,
+            output,
+        } => {
+            tidal_import::run_import(
+                &input,
+                tidal_import::ImportCommandOptions {
+                    name,
+                    description,
+                    dry_run,
+                    apply,
+                    include_review,
+                    include_probable,
+                    resume,
+                    output,
+                },
+            )
+            .await
+        }
     }
 }
 

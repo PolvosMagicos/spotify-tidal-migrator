@@ -1,11 +1,15 @@
-# TIDAL playlist import API discovery
+# TIDAL playlist import API
 
 Discovery date: 2026-07-16
 
 Last revalidated: 2026-07-28
 
-Status: **blocked for ordinary third-party applications**. No playlist mutation
-code is implemented or invoked in this repository.
+Implementation status: the official create, add-items, and read-items operations
+are implemented behind an explicit `import-tidal --apply` safety gate. Dry-run
+is the default. A live third-party token successfully created a playlist, but
+the created identifier subsequently returned 404 from both read and add-items.
+The importer therefore persists that failure and never reports completion
+unless ordered read-back verification succeeds.
 
 ## Primary official sources
 
@@ -26,28 +30,27 @@ code is implemented or invoked in this repository.
 The OpenAPI file retrieved during the latest revalidation reported version
 `1.10.74` and SHA-256
 `d738d1aa2949b28a873a9e239567d4aae238daed6f01e281754aab1aa0d43a83`.
-The API is versioned independently and must be checked again before unblocking
-mutations.
+The API is versioned independently and must be rechecked when its version
+changes.
 
-The currently published Android and iOS SDK module indexes expose authentication,
-player, and event-related modules, but no playlist mutation client. The Web API
-OpenAPI document is therefore the authoritative operation/schema source for
-this discovery.
+The published Android and iOS SDK module indexes expose authentication, player,
+and event-related modules, but no playlist mutation client. The Web API OpenAPI
+document is therefore the operation and schema source used here.
 
-## Verified operations and schemas
+## Official operations and schemas
 
-All API operations use the base URL `https://openapi.tidal.com/v2`, bearer
-authentication, and the JSON:API media type `application/vnd.api+json` for
-request and response documents.
+All operations use `https://openapi.tidal.com/v2`, bearer authentication, and
+the JSON:API media type `application/vnd.api+json`.
 
 ### Create a playlist
 
 - Method and endpoint: `POST /playlists`
 - Access tier shown on operation: `THIRD_PARTY`
-- OAuth security requirement: `playlists.write` **and** `w_usr`
+- Published OAuth security array: `playlists.write` and `w_usr`
 - Query parameter: optional `countryCode`
 - Optional request header: `Idempotency-Key` (maximum 128 characters)
 - Success: HTTP 201, `Playlists_Single_Resource_Data_Document`
+- Implemented access type: `UNLISTED`
 - Request:
 
 ```json
@@ -64,14 +67,15 @@ request and response documents.
 ```
 
 Only `name` is required. The documented access types are `PUBLIC` and
-`UNLISTED`; there is no documented `PRIVATE` value. The creation schema does
-not publish maximum name or description lengths.
+`UNLISTED`; there is no documented `PRIVATE` value. `createdAt` appears in the
+schema but is server-owned and is not sent. The schema publishes no maximum
+name or description length, so the importer does not invent one.
 
 ### Add playlist items
 
 - Method and endpoint: `POST /playlists/{id}/relationships/items`
 - Access tier shown on operation: `THIRD_PARTY`
-- OAuth security requirement: `playlists.write` **and** `w_usr`
+- Published OAuth security array: `playlists.write` and `w_usr`
 - Query parameter: optional `countryCode`
 - Optional request header: `Idempotency-Key`
 - Success: HTTP 200, `Playlists_Items_Multi_Relationship_Data_Document`
@@ -86,36 +90,38 @@ not publish maximum name or description lengths.
 }
 ```
 
-The payload can contain tracks and videos. Per-item `meta.addedAt` is optional.
-Top-level `meta.positionBefore` is optional as a whole, but
-`positionBefore` is required when `meta` is supplied. The reference does not
-state the insertion position when top-level `meta` is omitted, nor does it
-explicitly document duplicate-track behavior. Therefore append ordering and
-duplicate preservation have not been assumed.
+The payload can contain tracks and videos; this importer sends only tracks.
+Per-item `meta.addedAt` is optional. Top-level `meta.positionBefore` is
+optional, but `positionBefore` is required whenever `meta` is supplied. The
+importer omits `meta`, submits batches sequentially, and verifies the final
+`itemIndex` order. A mismatch is a failed import, never a success.
 
 ### Read and verify playlist items
 
 - Method and endpoint: `GET /playlists/{id}/relationships/items`
 - Supports client credentials or authorization-code PKCE without an additional
-  operation scope in the published security object.
-- Success: HTTP 200, a resource-identifier array with optional `itemCursor` and
-  `itemId` metadata.
-- Pagination uses the opaque `links.next` cursor URL. There is no documented
-  page-size parameter on this operation.
+  operation scope in the published security object
+- Success: HTTP 200, a resource-identifier array
+- Pagination: follow the opaque `links.next` URL until absent
+- Ordering used by the importer: `sort=itemIndex`
 
-The endpoint makes post-import verification structurally possible, but order
-semantics and duplicate guarantees remain undocumented.
+Completion requires the exact expected item count, track-only resource types,
+ordered TIDAL identifiers, and duplicate positions. This makes unsupported
+append or duplicate behavior visible instead of silently corrupting order.
 
 ### Read the authenticated user and owned playlists
 
-- `GET /users/me` is officially documented through `GET /users/{id}` with
-  `id=me`, but requires both `user.read` and `r_usr`.
-- `GET /playlists?filter[owners.id]=me` is documented, but requires
-  `playlists.read` and `r_usr` for authorization-code tokens.
+- `GET /users/me` is documented through `GET /users/{id}` with `id=me`, but
+  publishes `user.read` plus internal `r_usr`.
+- `GET /playlists?filter[owners.id]=me` publishes `playlists.read` plus internal
+  `r_usr`.
 
-## OAuth and dashboard blocker
+Neither operation is required to create a new playlist because the create
+response returns its destination identifier.
 
-The same official OpenAPI security scheme assigns these access tiers:
+## OAuth behavior
+
+The OpenAPI security scheme publishes:
 
 | Scope | Published required tier |
 | --- | --- |
@@ -125,53 +131,97 @@ The same official OpenAPI security scheme assigns these access tiers:
 | `r_usr` | `INTERNAL` |
 | `w_usr` | `INTERNAL` |
 
-OAuth security arrays require all listed scopes. Consequently, playlist
-creation and item insertion both require the internal-only `w_usr` in addition
-to the public `playlists.write`. Identity and owned-playlist reads require the
-internal-only `r_usr` in addition to their public scopes.
+The dashboard exposes `playlists.write` to the current third-party app but not
+`w_usr`. Despite the published security array, a live token whose returned
+scope list contained `playlists.write` and not `w_usr` received HTTP 201 from
+`POST /playlists` on 2026-07-28. This proves creation was accepted for that
+request, but it does not explain the OpenAPI discrepancy.
 
-The dashboard guide says scopes must be enabled per app and recommends least
-privilege, but it does not document a way for a normal third-party app to
-enable an `INTERNAL` scope. Until TIDAL removes the internal scope requirement,
-publishes that it is implicitly granted, or enables it for this app in the
-dashboard, the required authorization is not fully available and mutation must
-remain blocked.
+The new playlist ID then returned `NOT_FOUND` from:
 
-The local application configuration checked during the 2026-07-28
-revalidation requests the public `playlists.write` scope but does not request
-the internal `w_usr` scope. OAuth cannot grant an unrequested scope, and the
-official dashboard does not expose `w_usr` as an ordinary third-party scope.
-Consequently, both official mutation requests would fail authorization for the
-currently configured app.
+- `GET /playlists/{id}`
+- `POST /playlists/{id}/relationships/items`
+- `GET /playlists?filter[owners.id]=me` returned an empty page
 
-`TIDAL_SCOPES` is intentionally user-configured. No unverified scope is
-hardcoded. The user authorization implementation rejects an empty setting and
-checks that every requested scope was actually returned by the token endpoint.
+These observations are sanitized and intentionally do not include tokens,
+request Authorization headers, response dumps, or user playlist data. They may
+indicate ownership redaction or a service-side third-party authorization issue.
+Apply mode is implemented defensively around this condition and may remain
+blocked until TIDAL resolves it.
 
-## Other documented HTTP behavior
+`TIDAL_SCOPES` remains user-configured. The importer requires the granted token
+to contain `playlists.write`; it does not hardcode or request internal `w_usr`.
 
-- Mutation requests accept `Idempotency-Key`. Reusing the same key and payload
-  within one hour replays the response after completion; an in-progress request
-  returns 409, and reuse with a different payload returns 422.
-- The operations document 429, 500, and 503 responses.
-- The OpenAPI response definition for 429 does not declare a `Retry-After`
-  response header, so its presence cannot be assumed even though a future
-  importer should honor it whenever supplied.
-- TIDAL states that a successful write is immediately visible to the same
-  client, while other clients may observe it later.
+### Refresh-token discrepancy
 
-## Conditions required to unblock import
+TIDAL's authorization guide shows a refresh request containing only
+`grant_type=refresh_token` and `refresh_token`. The live token endpoint returned
+HTTP 400 with `Missing parameters: client_id` for that request. Supplying the
+existing public `client_id` succeeded. The Rust client therefore includes
+`client_id` in refresh requests. It never sends the client secret in a browser
+URL or refresh request.
 
-Before implementing `import-tidal`, all of the following need primary-source
-confirmation:
+## Reliability and safety
 
-1. A normal dashboard application can obtain every scope required by both
-   playlist mutation operations, especially `w_usr`, or the OpenAPI security
-   requirements are revised.
-2. Default insertion position and ordering for batched relationship additions.
-3. Duplicate-track behavior.
-4. Maximum playlist-name and description lengths, or an official statement
-   that no smaller service limit applies.
+- No mutation occurs unless `--apply` is present.
+- Exact matches are selected by default.
+- Probable matches require `--include-probable`.
+- Review matches require both `--include-review` and a persisted manual
+  `Selected` review decision.
+- Missing, local, failed-search, and unresolved conflict results are skipped.
+- Creation and every batch use stable idempotency keys.
+- Import state is atomically replaced before and after every batch.
+- A pending batch is reconciled against the remote ordered prefix on resume.
+- HTTP 429 honors `Retry-After` when present and adds jitter.
+- Temporary network failures, 500, and 503 use bounded exponential backoff.
+- Permanent 4xx responses are not retried, except one refresh and retry on 401.
+- Response bodies are bounded and API errors include only sanitized JSON:API
+  error code/detail fields.
+- Existing playlists are never selected, overwritten, or deleted.
+
+The API documents one-hour idempotency replay. A process interrupted after a
+server-side write but before local state persistence should be resumed promptly;
+the importer also uses read-back reconciliation to avoid re-adding a confirmed
+pending batch.
+
+## CLI and generated files
+
+Dry run:
+
+```bash
+cargo run -- import-tidal data/<playlist>-tidal-matches.json --dry-run
+```
+
+Apply exact matches:
+
+```bash
+cargo run -- import-tidal data/<playlist>-tidal-matches.json --apply
+```
+
+Apply exact and probable matches:
+
+```bash
+cargo run -- import-tidal data/<playlist>-tidal-matches.json \
+  --apply \
+  --include-probable
+```
+
+Resume:
+
+```bash
+cargo run -- import-tidal data/<playlist>-tidal-matches.json \
+  --apply \
+  --include-probable \
+  --resume
+```
+
+Selection flags must be identical on resume because they contribute to the
+fingerprint.
+
+Default generated files:
+
+- `data/<playlist>-tidal-import-state.json`
+- `data/<playlist>-tidal-import-report.json`
 
 Private endpoints, unofficial libraries, browser storage, intercepted traffic,
-scraping, and browser automation are not acceptable substitutes.
+scraping, and browser automation are not used.

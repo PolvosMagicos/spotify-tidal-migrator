@@ -20,15 +20,17 @@ use tokio::{
 };
 use url::Url;
 
+mod cache;
 mod matching;
 mod model;
 mod tidal;
 mod tidal_user;
 
+use cache::TidalSearchCache;
 use matching::{failed_match, match_candidates, search_query};
 use model::{
-    ExportedPlaylistMetadata, MatchReport, MatchSummary, SkippedPlaylistItem, SourceTrack,
-    SpotifyPlaylistExport,
+    ExportedPlaylistMetadata, MatchReport, MatchResult, MatchStatus, MatchSummary,
+    SkippedPlaylistItem, SourceTrack, SpotifyPlaylistExport,
 };
 
 const SPOTIFY_AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
@@ -392,7 +394,9 @@ async fn select_spotify_playlists(concurrency: usize) -> Result<()> {
     );
     let options = spotify_selection_options(liked_songs_total, playlists);
     let selected = MultiSelect::new("Select Spotify sources to migrate:", options)
-        .with_help_message("Use Space to toggle, Enter to confirm, and Esc to cancel")
+        .with_help_message(
+            "Space: toggle | Right: select all | Left: clear all | Enter: confirm | Esc: cancel",
+        )
         .with_page_size(15)
         .prompt_skippable()
         .context("Could not read the Spotify playlist selection")?;
@@ -413,6 +417,12 @@ async fn select_spotify_playlists(concurrency: usize) -> Result<()> {
     println!("Authenticating with TIDAL for read-only catalog matching...");
     let tidal_client = tidal::TidalClient::from_env().await?;
     println!("TIDAL authentication succeeded.");
+    let search_cache = TidalSearchCache::load_default()?;
+    println!(
+        "TIDAL cache: {} entries in {}",
+        search_cache.len()?,
+        search_cache.path().display()
+    );
 
     let mut summaries = Vec::with_capacity(selected_count);
     for (index, source) in selected.into_iter().enumerate() {
@@ -444,6 +454,7 @@ async fn select_spotify_playlists(concurrency: usize) -> Result<()> {
                     None,
                     &tidal_client,
                     concurrency,
+                    &search_cache,
                 )
                 .await
             }
@@ -491,6 +502,9 @@ struct SelectionMatchSummary {
     review: usize,
     missing: usize,
     errors: usize,
+    cache_hits: usize,
+    cache_misses: usize,
+    non_exact_tracks: Vec<String>,
     report_path: Option<PathBuf>,
     failure: Option<String>,
 }
@@ -509,6 +523,9 @@ impl SelectionMatchSummary {
             review: 0,
             missing: 0,
             errors: 0,
+            cache_hits: 0,
+            cache_misses: 0,
+            non_exact_tracks: Vec::new(),
             report_path: None,
             failure: Some(failure),
         }
@@ -524,6 +541,8 @@ struct SelectionMatchTotals {
     review: usize,
     missing: usize,
     errors: usize,
+    cache_hits: usize,
+    cache_misses: usize,
     failed_sources: usize,
 }
 
@@ -538,10 +557,68 @@ fn selection_match_totals(summaries: &[SelectionMatchSummary]) -> SelectionMatch
         totals.review += summary.review;
         totals.missing += summary.missing;
         totals.errors += summary.errors;
+        totals.cache_hits += summary.cache_hits;
+        totals.cache_misses += summary.cache_misses;
         totals.failed_sources += usize::from(summary.failure.is_some());
     }
 
     totals
+}
+
+fn non_exact_track_lines(results: &[MatchResult]) -> Vec<String> {
+    results
+        .iter()
+        .filter(|result| result.status != MatchStatus::Exact)
+        .map(|result| {
+            let track = &result.spotify_track;
+            let artist = track
+                .artists
+                .first()
+                .map_or("Unknown artist", String::as_str);
+            let score = result
+                .score
+                .map_or_else(|| "no score".to_owned(), |score| format!("{score}/100"));
+            let error_marker = if result.error.is_some() {
+                " [search error]"
+            } else {
+                ""
+            };
+
+            format!(
+                "#{} {} — {} — {} ({score}){error_marker}",
+                track.position,
+                terminal_safe(&track.title),
+                terminal_safe(artist),
+                result.status
+            )
+        })
+        .collect()
+}
+
+fn print_non_exact_tracks(summaries: &[SelectionMatchSummary]) {
+    let total: usize = summaries
+        .iter()
+        .map(|summary| summary.non_exact_tracks.len())
+        .sum();
+
+    println!();
+    println!("Non-exact tracks: {total}");
+    if total == 0 {
+        println!("All processed tracks were Exact.");
+        return;
+    }
+
+    for summary in summaries {
+        if summary.non_exact_tracks.is_empty() {
+            continue;
+        }
+
+        println!();
+        println!("- {}", terminal_safe(&summary.source_name));
+        for line in &summary.non_exact_tracks {
+            println!("  {line}");
+        }
+    }
 }
 
 fn print_selection_match_summary(summaries: &[SelectionMatchSummary]) {
@@ -569,6 +646,10 @@ fn print_selection_match_summary(summaries: &[SelectionMatchSummary]) {
             summary.missing,
             summary.errors
         );
+        println!(
+            "  Cache hits: {} | Cache misses: {}",
+            summary.cache_hits, summary.cache_misses
+        );
         if let Some(path) = &summary.report_path {
             println!("  Report: {}", path.display());
         }
@@ -586,12 +667,17 @@ fn print_selection_match_summary(summaries: &[SelectionMatchSummary]) {
         totals.missing,
         totals.errors
     );
+    println!(
+        "Cache — Hits: {} | Misses: {}",
+        totals.cache_hits, totals.cache_misses
+    );
     if totals.failed_sources > 0 {
         println!(
             "Sources that could not be processed: {}",
             totals.failed_sources
         );
     }
+    print_non_exact_tracks(summaries);
     println!();
 }
 
@@ -641,11 +727,25 @@ async fn match_tidal_playlist(
     let tidal_client = tidal::TidalClient::from_env().await?;
     println!("TIDAL authentication succeeded.");
     println!("Country: {}", tidal_client.country_code());
+    let search_cache = TidalSearchCache::load_default()?;
+    println!(
+        "Cache: {} entries in {}",
+        search_cache.len()?,
+        search_cache.path().display()
+    );
     println!();
 
-    match_tidal_playlist_with_client(input, limit, output, &tidal_client, concurrency)
-        .await
-        .map(|_| ())
+    let summary = match_tidal_playlist_with_client(
+        input,
+        limit,
+        output,
+        &tidal_client,
+        concurrency,
+        &search_cache,
+    )
+    .await?;
+    print_non_exact_tracks(std::slice::from_ref(&summary));
+    Ok(())
 }
 
 async fn match_tidal_playlist_with_client(
@@ -654,6 +754,7 @@ async fn match_tidal_playlist_with_client(
     output: Option<PathBuf>,
     tidal_client: &tidal::TidalClient,
     concurrency: usize,
+    search_cache: &TidalSearchCache,
 ) -> Result<SelectionMatchSummary> {
     let bytes = fs::read(input)
         .with_context(|| format!("Could not read Spotify export {}", input.display()))?;
@@ -679,26 +780,60 @@ async fn match_tidal_playlist_with_client(
     let searches = stream::iter(export.tracks.iter().take(track_count).cloned().enumerate())
         .map(|(index, track)| async move {
             let query = search_query(&track);
-            let result = match tidal_client
-                .search_tracks(&track.title, &track.artists)
-                .await
-            {
-                Ok(candidates) => match_candidates(&track, query, candidates),
-                Err(error) => failed_match(&track, query, format!("{error:#}")),
+            let cached_candidates = match search_cache.get(tidal_client.country_code(), &query) {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    eprintln!("Could not read the TIDAL search cache: {error:#}");
+                    None
+                }
             };
 
-            (index, result)
+            let (result, cache_hit) = match cached_candidates {
+                Some(candidates) => (match_candidates(&track, query, candidates), true),
+                None => {
+                    let result = match tidal_client
+                        .search_tracks(&track.title, &track.artists)
+                        .await
+                    {
+                        Ok(candidates) => {
+                            if let Ok(timestamp) = current_unix_timestamp()
+                                && let Err(error) = search_cache.insert(
+                                    tidal_client.country_code(),
+                                    &query,
+                                    &candidates,
+                                    timestamp,
+                                )
+                            {
+                                eprintln!("Could not update the TIDAL search cache: {error:#}");
+                            }
+                            match_candidates(&track, query, candidates)
+                        }
+                        Err(error) => failed_match(&track, query, format!("{error:#}")),
+                    };
+                    (result, false)
+                }
+            };
+
+            (index, result, cache_hit)
         })
         .buffer_unordered(concurrency);
     tokio::pin!(searches);
 
     let mut completed = Vec::with_capacity(track_count);
-    while let Some((index, result)) = searches.next().await {
+    let mut cache_hits = 0_usize;
+    let mut cache_misses = 0_usize;
+    while let Some((index, result, cache_hit)) = searches.next().await {
+        if cache_hit {
+            cache_hits += 1;
+        } else {
+            cache_misses += 1;
+        }
         let completed_count = completed.len() + 1;
         let track = &result.spotify_track;
+        let cache_marker = if cache_hit { " [cache]" } else { "" };
         match result.score {
             Some(score) => println!(
-                "[{completed_count}/{track_count}] #{} {} — {}: {} ({score}/100)",
+                "[{completed_count}/{track_count}] #{} {} — {}: {} ({score}/100){cache_marker}",
                 index + 1,
                 track.title,
                 track
@@ -708,7 +843,7 @@ async fn match_tidal_playlist_with_client(
                 result.status
             ),
             None => println!(
-                "[{completed_count}/{track_count}] #{} {} — {}: {}",
+                "[{completed_count}/{track_count}] #{} {} — {}: {}{cache_marker}",
                 index + 1,
                 track.title,
                 track
@@ -749,6 +884,8 @@ async fn match_tidal_playlist_with_client(
     println!("Probable: {}", report.summary.probable);
     println!("Review: {}", report.summary.review);
     println!("Missing: {}", report.summary.missing);
+    println!("Cache hits: {cache_hits}");
+    println!("Cache misses: {cache_misses}");
     println!("Saved to: {}", destination.display());
 
     Ok(SelectionMatchSummary {
@@ -763,6 +900,9 @@ async fn match_tidal_playlist_with_client(
             .iter()
             .filter(|result| result.error.is_some())
             .count(),
+        cache_hits,
+        cache_misses,
+        non_exact_tracks: non_exact_track_lines(&report.results),
         report_path: Some(destination),
         failure: None,
     })
@@ -1592,9 +1732,11 @@ fn random_string(length: usize) -> String {
 mod tests {
     use super::{
         SelectionMatchSummary, SelectionMatchTotals, SpotifyPlaylistsPage, SpotifySavedTracksPage,
-        SpotifySelectionOption, parse_concurrency, restore_source_order, selection_match_totals,
-        spotify_offset_page_url, spotify_retry_delay, spotify_selection_options, terminal_safe,
+        SpotifySelectionOption, non_exact_track_lines, parse_concurrency, restore_source_order,
+        selection_match_totals, spotify_offset_page_url, spotify_retry_delay,
+        spotify_selection_options, terminal_safe,
     };
+    use crate::model::{MatchResult, MatchStatus, SourceTrack};
 
     #[test]
     fn deserializes_current_user_playlists_page() {
@@ -1710,6 +1852,9 @@ mod tests {
                 review: 1,
                 missing: 1,
                 errors: 0,
+                cache_hits: 6,
+                cache_misses: 4,
+                non_exact_tracks: Vec::new(),
                 report_path: None,
                 failure: None,
             },
@@ -1729,8 +1874,49 @@ mod tests {
                 review: 1,
                 missing: 1,
                 errors: 0,
+                cache_hits: 6,
+                cache_misses: 4,
                 failed_sources: 1,
             }
+        );
+    }
+
+    #[test]
+    fn lists_only_non_exact_track_titles_in_source_order() {
+        let result = |position, title: &str, status, score| MatchResult {
+            spotify_track: SourceTrack {
+                position,
+                added_at: None,
+                spotify_id: None,
+                spotify_uri: format!("spotify:track:{position}"),
+                title: title.to_owned(),
+                artists: vec!["Artista".to_owned()],
+                album: None,
+                duration_ms: 180_000,
+                isrc: None,
+                explicit: false,
+                is_local: false,
+            },
+            status,
+            best_candidate: None,
+            score,
+            reasons: Vec::new(),
+            alternatives: Vec::new(),
+            search_query: title.to_owned(),
+            error: None,
+        };
+        let results = vec![
+            result(1, "Exacta", MatchStatus::Exact, Some(100)),
+            result(2, "Revisar", MatchStatus::Review, Some(70)),
+            result(3, "Ausente", MatchStatus::Missing, None),
+        ];
+
+        assert_eq!(
+            non_exact_track_lines(&results),
+            vec![
+                "#2 Revisar — Artista — Review (70/100)",
+                "#3 Ausente — Artista — Missing (no score)",
+            ]
         );
     }
 

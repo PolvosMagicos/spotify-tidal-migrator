@@ -29,7 +29,7 @@ mod tidal_user;
 use cache::TidalSearchCache;
 use matching::{failed_match, fallback_search_queries, match_candidates, search_query};
 use model::{
-    ExportedPlaylistMetadata, MatchReport, MatchResult, MatchStatus, MatchSummary,
+    ExportedPlaylistMetadata, MatchReport, MatchResult, MatchStatus, MatchSummary, ReviewReport,
     SkippedPlaylistItem, SourceTrack, SpotifyPlaylistExport, TidalTrackCandidate,
 };
 
@@ -566,6 +566,7 @@ struct SelectionMatchSummary {
     fallback_queries: usize,
     non_exact_tracks: Vec<String>,
     report_path: Option<PathBuf>,
+    review_report_path: Option<PathBuf>,
     failure: Option<String>,
 }
 
@@ -588,6 +589,7 @@ impl SelectionMatchSummary {
             fallback_queries: 0,
             non_exact_tracks: Vec::new(),
             report_path: None,
+            review_report_path: None,
             failure: Some(failure),
         }
     }
@@ -714,7 +716,10 @@ fn print_selection_match_summary(summaries: &[SelectionMatchSummary]) {
             summary.cache_hits, summary.cache_misses, summary.fallback_queries
         );
         if let Some(path) = &summary.report_path {
-            println!("  Report: {}", path.display());
+            println!("  Match report: {}", path.display());
+        }
+        if let Some(path) = &summary.review_report_path {
+            println!("  Review report: {}", path.display());
         }
     }
 
@@ -1105,6 +1110,9 @@ async fn match_tidal_playlist_with_client(
     };
 
     write_json(&destination, &report)?;
+    let review_destination = default_review_report_path(&destination);
+    let review_report = ReviewReport::from_match_report(&report, destination.display().to_string());
+    write_json(&review_destination, &review_report)?;
 
     println!();
     println!("Playlist: {}", report.source_playlist.name);
@@ -1116,7 +1124,12 @@ async fn match_tidal_playlist_with_client(
     println!("Search cache hits: {cache_hits}");
     println!("Search cache misses: {cache_misses}");
     println!("Fallback queries: {fallback_queries}");
-    println!("Saved to: {}", destination.display());
+    println!("Match report: {}", destination.display());
+    println!(
+        "Review report: {} ({} tracks)",
+        review_destination.display(),
+        review_report.review_tracks.len()
+    );
 
     Ok(SelectionMatchSummary {
         source_name: report.source_playlist.name.clone(),
@@ -1135,6 +1148,7 @@ async fn match_tidal_playlist_with_client(
         fallback_queries,
         non_exact_tracks: non_exact_track_lines(&report.results),
         report_path: Some(destination),
+        review_report_path: Some(review_destination),
         failure: None,
     })
 }
@@ -1690,6 +1704,22 @@ fn default_match_report_path(input: &Path) -> PathBuf {
         .join(filename)
 }
 
+fn default_review_report_path(match_report: &Path) -> PathBuf {
+    let stem = match_report
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("tidal-matches");
+    let base = stem.strip_suffix("-tidal-matches").unwrap_or(stem);
+    let filename = format!("{base}-tidal-review.json");
+
+    match_report
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("data"))
+        .join(filename)
+}
+
 fn sanitize_filename(value: &str) -> String {
     let mut result = String::new();
     let mut previous_was_separator = false;
@@ -1961,11 +1991,13 @@ fn random_string(length: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use super::{
         SelectionMatchSummary, SelectionMatchTotals, SpotifyPlaylistsPage, SpotifySavedTracksPage,
-        SpotifySelectionOption, merge_unique_candidates, non_exact_track_lines, parse_concurrency,
-        restore_source_order, selection_match_totals, spotify_offset_page_url, spotify_retry_delay,
-        spotify_selection_options, terminal_safe,
+        SpotifySelectionOption, default_review_report_path, merge_unique_candidates,
+        non_exact_track_lines, parse_concurrency, restore_source_order, selection_match_totals,
+        spotify_offset_page_url, spotify_retry_delay, spotify_selection_options, terminal_safe,
     };
     use crate::model::{MatchResult, MatchStatus, SourceTrack, TidalTrackCandidate};
 
@@ -2073,6 +2105,18 @@ mod tests {
     }
 
     #[test]
+    fn derives_a_dedicated_review_report_path() {
+        assert_eq!(
+            default_review_report_path(Path::new("data/liked-songs-tidal-matches.json")),
+            PathBuf::from("data/liked-songs-tidal-review.json")
+        );
+        assert_eq!(
+            default_review_report_path(Path::new("data/custom-report.json")),
+            PathBuf::from("data/custom-report-tidal-review.json")
+        );
+    }
+
+    #[test]
     fn aggregates_match_summaries_without_counting_review_as_matched() {
         let summaries = vec![
             SelectionMatchSummary {
@@ -2088,6 +2132,7 @@ mod tests {
                 fallback_queries: 2,
                 non_exact_tracks: Vec::new(),
                 report_path: None,
+                review_report_path: None,
                 failure: None,
             },
             SelectionMatchSummary::failed(

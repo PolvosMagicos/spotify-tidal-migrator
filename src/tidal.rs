@@ -19,6 +19,9 @@ const TIDAL_TOKEN_URL: &str = "https://auth.tidal.com/v1/oauth2/token";
 const TIDAL_API_URL: &str = "https://openapi.tidal.com/v2";
 const TIDAL_MEDIA_TYPE: &str = "application/vnd.api+json";
 const MAX_ATTEMPTS: usize = 3;
+const MIN_RATE_LIMIT: f64 = 0.1;
+const MAX_RATE_LIMIT: f64 = 50.0;
+const RECOVERY_SUCCESS_COUNT: u16 = 20;
 
 #[derive(Debug, Deserialize)]
 struct TidalTokenResponse {
@@ -41,6 +44,7 @@ struct RequestGateState {
     next_start: Instant,
     interval: Duration,
     cooldown_until: Option<Instant>,
+    successes_since_throttle: u16,
 }
 
 impl RequestGate {
@@ -50,6 +54,7 @@ impl RequestGate {
                 next_start: Instant::now(),
                 interval,
                 cooldown_until: None,
+                successes_since_throttle: 0,
             }),
             base_interval: interval,
         }
@@ -83,6 +88,7 @@ impl RequestGate {
 
         if is_new_incident {
             state.interval = state.interval.saturating_mul(2).min(Duration::from_secs(2));
+            state.successes_since_throttle = 0;
         }
 
         (state.interval, is_new_incident)
@@ -90,17 +96,25 @@ impl RequestGate {
 
     async fn record_success(&self) {
         let mut state = self.state.lock().await;
-        if state.interval > self.base_interval {
-            state.interval = state
-                .interval
-                .saturating_sub(Duration::from_millis(1))
-                .max(self.base_interval);
+        if state.interval <= self.base_interval {
+            state.successes_since_throttle = 0;
+            return;
+        }
+
+        state.successes_since_throttle = state.successes_since_throttle.saturating_add(1);
+        if state.successes_since_throttle >= RECOVERY_SUCCESS_COUNT {
+            state.interval = state.interval.mul_f64(0.8).max(self.base_interval);
+            state.successes_since_throttle = 0;
         }
     }
 }
 
 impl TidalClient {
     pub async fn from_env() -> Result<Self> {
+        Self::from_env_with_rate_limit(None).await
+    }
+
+    pub async fn from_env_with_rate_limit(rate_limit: Option<f64>) -> Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -121,12 +135,16 @@ impl TidalClient {
             client,
             access_token: token.access_token,
             country_code,
-            request_gate: RequestGate::new(search_interval()),
+            request_gate: RequestGate::new(search_interval(rate_limit)?),
         })
     }
 
     pub fn country_code(&self) -> &str {
         &self.country_code
+    }
+
+    pub fn request_rate_limit(&self) -> f64 {
+        1.0 / self.request_gate.base_interval.as_secs_f64()
     }
 
     pub async fn search_tracks(
@@ -223,13 +241,44 @@ impl TidalClient {
     }
 }
 
-fn search_interval() -> Duration {
+fn search_interval(rate_limit: Option<f64>) -> Result<Duration> {
+    let configured_rate = match rate_limit {
+        Some(value) => Some(validate_rate_limit(value).map_err(anyhow::Error::msg)?),
+        None => env::var("TIDAL_SEARCH_RATE_LIMIT")
+            .ok()
+            .map(|value| parse_rate_limit(&value).map_err(anyhow::Error::msg))
+            .transpose()?,
+    };
+
+    if let Some(rate_limit) = configured_rate {
+        return Ok(Duration::from_secs_f64(1.0 / rate_limit));
+    }
+
     let milliseconds = env::var("TIDAL_SEARCH_DELAY_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(150);
+        .unwrap_or(150)
+        .max(1);
 
-    Duration::from_millis(milliseconds)
+    Ok(Duration::from_millis(milliseconds))
+}
+
+pub fn parse_rate_limit(value: &str) -> std::result::Result<f64, String> {
+    let rate_limit = value.parse::<f64>().map_err(|_| {
+        format!("rate limit must be a number from {MIN_RATE_LIMIT} to {MAX_RATE_LIMIT}")
+    })?;
+
+    validate_rate_limit(rate_limit)
+}
+
+fn validate_rate_limit(rate_limit: f64) -> std::result::Result<f64, String> {
+    if !rate_limit.is_finite() || !(MIN_RATE_LIMIT..=MAX_RATE_LIMIT).contains(&rate_limit) {
+        return Err(format!(
+            "rate limit must be from {MIN_RATE_LIMIT} to {MAX_RATE_LIMIT} requests per second"
+        ));
+    }
+
+    Ok(rate_limit)
 }
 
 pub async fn test_catalog() -> Result<()> {
@@ -486,7 +535,9 @@ fn parse_iso_8601_duration_ms(value: &str) -> Option<u64> {
 mod tests {
     use std::time::Duration;
 
-    use super::{RequestGate, parse_duration_ms, parse_search_response};
+    use super::{
+        RequestGate, parse_duration_ms, parse_rate_limit, parse_search_response, search_interval,
+    };
     use serde_json::json;
 
     #[test]
@@ -543,5 +594,39 @@ mod tests {
             gate.apply_rate_limit(Duration::from_secs(1)).await,
             (Duration::from_millis(600), true)
         );
+    }
+
+    #[test]
+    fn validates_and_converts_request_rates() {
+        assert_eq!(parse_rate_limit("0.1"), Ok(0.1));
+        assert_eq!(parse_rate_limit("6"), Ok(6.0));
+        assert_eq!(parse_rate_limit("50"), Ok(50.0));
+        assert!(parse_rate_limit("0").is_err());
+        assert!(parse_rate_limit("51").is_err());
+        assert!(parse_rate_limit("NaN").is_err());
+        assert!(parse_rate_limit("many").is_err());
+        assert_eq!(
+            search_interval(Some(5.0)).unwrap(),
+            Duration::from_millis(200)
+        );
+    }
+
+    #[tokio::test]
+    async fn recovers_rate_in_steps_after_sustained_success() {
+        let gate = RequestGate::new(Duration::from_millis(100));
+        gate.apply_rate_limit(Duration::from_secs(1)).await;
+
+        for _ in 0..19 {
+            gate.record_success().await;
+        }
+        assert_eq!(gate.state.lock().await.interval, Duration::from_millis(200));
+
+        gate.record_success().await;
+        assert_eq!(gate.state.lock().await.interval, Duration::from_millis(160));
+
+        for _ in 0..100 {
+            gate.record_success().await;
+        }
+        assert_eq!(gate.state.lock().await.interval, Duration::from_millis(100));
     }
 }

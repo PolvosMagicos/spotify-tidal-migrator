@@ -87,6 +87,10 @@ enum Command {
         #[arg(long, default_value_t = 4, value_parser = parse_concurrency)]
         concurrency: usize,
 
+        /// Maximum sustained TIDAL search starts per second.
+        #[arg(long, value_parser = tidal::parse_rate_limit)]
+        rate_limit: Option<f64>,
+
         /// Ignore cached TIDAL searches and replace them with fresh responses.
         #[arg(long)]
         refresh_cache: bool,
@@ -108,6 +112,10 @@ enum Command {
         /// Maximum number of simultaneous TIDAL catalog searches.
         #[arg(long, default_value_t = 4, value_parser = parse_concurrency)]
         concurrency: usize,
+
+        /// Maximum sustained TIDAL search starts per second.
+        #[arg(long, value_parser = tidal::parse_rate_limit)]
+        rate_limit: Option<f64>,
 
         /// Ignore cached TIDAL searches and replace them with fresh responses.
         #[arg(long)]
@@ -356,20 +364,36 @@ async fn main() -> Result<()> {
         } => export_spotify_liked(output, concurrency).await.map(|_| ()),
         Command::SelectSpotify {
             concurrency,
+            rate_limit,
             refresh_cache,
-        } => select_spotify_playlists(concurrency, refresh_cache).await,
+        } => select_spotify_playlists(concurrency, rate_limit, refresh_cache).await,
         Command::MatchTidal {
             input,
             limit,
             output,
             concurrency,
+            rate_limit,
             refresh_cache,
-        } => match_tidal_playlist(&input, limit, output, concurrency, refresh_cache).await,
+        } => {
+            match_tidal_playlist(
+                &input,
+                limit,
+                output,
+                concurrency,
+                rate_limit,
+                refresh_cache,
+            )
+            .await
+        }
         Command::TidalTest => tidal::test_catalog().await,
     }
 }
 
-async fn select_spotify_playlists(concurrency: usize, refresh_cache: bool) -> Result<()> {
+async fn select_spotify_playlists(
+    concurrency: usize,
+    rate_limit: Option<f64>,
+    refresh_cache: bool,
+) -> Result<()> {
     let token = valid_spotify_token().await?;
     let client = Client::new();
     let mut liked_songs_url = Url::parse(&format!("{SPOTIFY_API_URL}/me/tracks"))?;
@@ -427,8 +451,12 @@ async fn select_spotify_playlists(concurrency: usize, refresh_cache: bool) -> Re
     let selected_count = selected.len();
     println!("Selected {selected_count} source(s).");
     println!("Authenticating with TIDAL for read-only catalog matching...");
-    let tidal_client = tidal::TidalClient::from_env().await?;
+    let tidal_client = tidal::TidalClient::from_env_with_rate_limit(rate_limit).await?;
     println!("TIDAL authentication succeeded.");
+    println!(
+        "Sustained TIDAL request rate: {:.2}/second",
+        tidal_client.request_rate_limit()
+    );
     let search_cache = TidalSearchCache::load_default()?;
     println!(
         "TIDAL cache: {} entries in {}",
@@ -732,15 +760,20 @@ async fn match_tidal_playlist(
     limit: Option<usize>,
     output: Option<PathBuf>,
     concurrency: usize,
+    rate_limit: Option<f64>,
     refresh_cache: bool,
 ) -> Result<()> {
     println!("Authenticating with TIDAL...");
 
     // Authentication happens exactly once; this client and its bearer token
     // are reused for every catalog request in the run.
-    let tidal_client = tidal::TidalClient::from_env().await?;
+    let tidal_client = tidal::TidalClient::from_env_with_rate_limit(rate_limit).await?;
     println!("TIDAL authentication succeeded.");
     println!("Country: {}", tidal_client.country_code());
+    println!(
+        "Sustained request rate: {:.2}/second",
+        tidal_client.request_rate_limit()
+    );
     let search_cache = TidalSearchCache::load_default()?;
     println!(
         "Cache: {} entries in {}",

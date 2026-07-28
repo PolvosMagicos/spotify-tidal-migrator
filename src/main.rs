@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand, ValueEnum};
 use futures_util::{StreamExt, stream};
-use inquire::MultiSelect;
+use inquire::{MultiSelect, Select};
 use rand::{RngExt, distr::Alphanumeric};
 use reqwest::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -29,8 +29,9 @@ mod tidal_user;
 use cache::TidalSearchCache;
 use matching::{failed_match, fallback_search_queries, match_candidates, search_query};
 use model::{
-    ExportedPlaylistMetadata, MatchReport, MatchResult, MatchStatus, MatchSummary, ReviewReport,
-    SkippedPlaylistItem, SourceTrack, SpotifyPlaylistExport, TidalTrackCandidate,
+    ExportedPlaylistMetadata, MatchReport, MatchResult, MatchStatus, MatchSummary, ReviewDecision,
+    ReviewDecisionAction, ReviewDecisionReport, ReviewReport, SkippedPlaylistItem, SourceTrack,
+    SpotifyPlaylistExport, TidalTrackCandidate,
 };
 
 const SPOTIFY_AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
@@ -132,6 +133,12 @@ enum Command {
 
     /// Verify TIDAL authentication and catalog access.
     TidalTest,
+
+    /// Interactively resolve tracks classified as Review without modifying TIDAL.
+    Review {
+        /// Optional review-report paths; omit to select reports discovered under data/.
+        inputs: Vec<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -400,6 +407,7 @@ async fn main() -> Result<()> {
             .await
         }
         Command::TidalTest => tidal::test_catalog().await,
+        Command::Review { inputs } => review_tracks(&inputs),
     }
 }
 
@@ -538,6 +546,508 @@ async fn select_spotify_playlists(
     print_selection_match_summary(&summaries);
     println!("No TIDAL import was performed.");
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ReviewReportOption {
+    path: PathBuf,
+    playlist_name: String,
+    review_count: usize,
+}
+
+impl std::fmt::Display for ReviewReportOption {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} — {} tracks to review — {}",
+            terminal_safe(&self.playlist_name),
+            self.review_count,
+            self.path.display()
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+enum TidalReviewChoice {
+    Candidate {
+        candidate: TidalTrackCandidate,
+        rank: usize,
+        score: u8,
+        suggested: bool,
+        version_conflict: bool,
+    },
+    Skip,
+}
+
+impl std::fmt::Display for TidalReviewChoice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Skip => write!(formatter, "Skip — exclude this track from a future import"),
+            Self::Candidate {
+                candidate,
+                score,
+                suggested,
+                version_conflict,
+                ..
+            } => {
+                let artists = if candidate.artists.is_empty() {
+                    "Unknown artist".to_owned()
+                } else {
+                    candidate.artists.join(", ")
+                };
+                let album = candidate.album.as_deref().unwrap_or("Unknown album");
+                let duration = candidate
+                    .duration_ms
+                    .map_or_else(|| "unknown duration".to_owned(), format_duration);
+                let explicit = match candidate.explicit {
+                    Some(true) => "explicit",
+                    Some(false) => "clean",
+                    None => "explicitness unknown",
+                };
+                let isrc = candidate.isrc.as_deref().unwrap_or("no ISRC");
+                let version = candidate
+                    .version
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .map_or_else(String::new, |value| {
+                        format!(" | version: {}", terminal_safe(value))
+                    });
+                let suggested = if *suggested { " | suggested" } else { "" };
+                let conflict = if *version_conflict {
+                    " | VERSION CONFLICT"
+                } else {
+                    ""
+                };
+
+                write!(
+                    formatter,
+                    "[{score}%] {} — {} | album: {} | {} | {} | ISRC: {}{}{}{}",
+                    terminal_safe(&candidate.title),
+                    terminal_safe(&artists),
+                    terminal_safe(album),
+                    duration,
+                    explicit,
+                    terminal_safe(isrc),
+                    version,
+                    suggested,
+                    conflict
+                )
+            }
+        }
+    }
+}
+
+fn review_tracks(inputs: &[PathBuf]) -> Result<()> {
+    let available = if inputs.is_empty() {
+        discover_review_reports(Path::new("data"))?
+    } else {
+        inputs
+            .iter()
+            .map(|path| review_report_option(path))
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    if available.is_empty() {
+        println!(
+            "No playlists with Review tracks were found. Run `cargo run -- match-tidal <export.json>` first."
+        );
+        return Ok(());
+    }
+
+    let selected = if inputs.is_empty() {
+        MultiSelect::new(
+            "Select playlists whose Review tracks you want to resolve:",
+            available,
+        )
+        .with_help_message(
+            "Space: toggle | Right: select all | Left: clear all | Enter: confirm | Esc: cancel",
+        )
+        .with_page_size(15)
+        .prompt_skippable()
+        .context("Could not read the review-report selection")?
+    } else {
+        Some(available)
+    };
+
+    let Some(selected) = selected else {
+        println!("Review cancelled.");
+        return Ok(());
+    };
+    if selected.is_empty() {
+        println!("No review reports selected.");
+        return Ok(());
+    }
+
+    let mut reviewed = 0;
+    let mut skipped = 0;
+    for option in selected {
+        let outcome = review_one_report(&option.path)?;
+        reviewed += outcome.selected;
+        skipped += outcome.skipped;
+        if outcome.cancelled {
+            break;
+        }
+    }
+
+    println!();
+    println!("Review session completed.");
+    println!("TIDAL candidates selected: {reviewed}");
+    println!("Tracks explicitly skipped: {skipped}");
+    println!("No TIDAL playlist or library changes were made.");
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct ReviewSessionOutcome {
+    selected: usize,
+    skipped: usize,
+    cancelled: bool,
+}
+
+fn review_one_report(path: &Path) -> Result<ReviewSessionOutcome> {
+    let review_report: ReviewReport = read_json(path, "review report")?;
+    if review_report.schema_version != 1 {
+        bail!(
+            "Unsupported review report schema version {} in {}; expected version 1",
+            review_report.schema_version,
+            path.display()
+        );
+    }
+
+    let match_report_path = PathBuf::from(&review_report.source_match_report);
+    let match_report: MatchReport =
+        read_json(&match_report_path, "match report").with_context(|| {
+            format!(
+                "The review report {} references {}",
+                path.display(),
+                match_report_path.display()
+            )
+        })?;
+    if match_report.schema_version != 1 {
+        bail!(
+            "Unsupported match report schema version {} in {}; expected version 1",
+            match_report.schema_version,
+            match_report_path.display()
+        );
+    }
+    if match_report.source_playlist.spotify_id != review_report.source_playlist.spotify_id {
+        bail!(
+            "Review report {} and match report {} refer to different Spotify playlists",
+            path.display(),
+            match_report_path.display()
+        );
+    }
+
+    let review_results: Vec<_> = match_report
+        .results
+        .iter()
+        .filter(|result| result.status == MatchStatus::Review)
+        .collect();
+    let decision_path = default_review_decisions_path(path);
+    let mut decisions = load_existing_review_decisions(
+        &decision_path,
+        &match_report.source_playlist.spotify_id,
+        match_report.generated_at_unix,
+    )?;
+
+    println!();
+    println!(
+        "Playlist: {} — {} tracks to review",
+        terminal_safe(&match_report.source_playlist.name),
+        review_results.len()
+    );
+
+    let mut cancelled = false;
+    for (index, result) in review_results.iter().enumerate() {
+        let track = &result.spotify_track;
+        let artists = if track.artists.is_empty() {
+            "Unknown artist".to_owned()
+        } else {
+            track.artists.join(", ")
+        };
+
+        println!();
+        println!("Review {}/{}", index + 1, review_results.len());
+        println!(
+            "Spotify: {} — {}",
+            terminal_safe(&track.title),
+            terminal_safe(&artists)
+        );
+        println!(
+            "Album: {}",
+            terminal_safe(track.album.as_deref().unwrap_or("Unknown album"))
+        );
+        println!(
+            "Duration: {} | {} | ISRC: {}",
+            format_duration(track.duration_ms),
+            if track.explicit { "explicit" } else { "clean" },
+            terminal_safe(track.isrc.as_deref().unwrap_or("no ISRC"))
+        );
+        println!(
+            "Machine match: {}",
+            result
+                .score
+                .map_or_else(|| "no score".to_owned(), |score| format!("{score}%"))
+        );
+        for reason in &result.reasons {
+            println!("  - {}", terminal_safe(reason));
+        }
+
+        let choices = tidal_review_choices(result);
+        let starting_cursor = existing_review_cursor(&choices, decisions.get(&track.position));
+        let prompt = format!(
+            "Choose the TIDAL track for \"{}\":",
+            terminal_safe(&track.title)
+        );
+        let selection = Select::new(&prompt, choices)
+            .with_starting_cursor(starting_cursor)
+            .with_page_size(8)
+            .with_help_message(
+                "Enter: select candidate | Skip option: exclude track | Esc: save and stop",
+            )
+            .prompt_skippable()
+            .context("Could not read the TIDAL candidate selection")?;
+
+        let Some(selection) = selection else {
+            println!("Review stopped; completed decisions will be saved.");
+            cancelled = true;
+            break;
+        };
+
+        let decision = decision_from_choice(track, selection);
+        match decision.action {
+            ReviewDecisionAction::Selected => println!(
+                "Selected TIDAL track {}.",
+                decision
+                    .selected_tidal_candidate
+                    .as_ref()
+                    .map_or("unknown", |candidate| candidate.tidal_id.as_str())
+            ),
+            ReviewDecisionAction::Skipped => println!("Track marked to skip."),
+        }
+        decisions.insert(track.position, decision);
+    }
+
+    let decisions: Vec<_> = decisions.into_values().collect();
+    let selected_count = decisions
+        .iter()
+        .filter(|decision| decision.action == ReviewDecisionAction::Selected)
+        .count();
+    let skipped_count = decisions
+        .iter()
+        .filter(|decision| decision.action == ReviewDecisionAction::Skipped)
+        .count();
+    let decision_report = ReviewDecisionReport {
+        schema_version: 1,
+        generated_at_unix: current_unix_timestamp()?,
+        source_playlist: match_report.source_playlist,
+        source_match_report: match_report_path.display().to_string(),
+        source_match_generated_at_unix: match_report.generated_at_unix,
+        source_review_report: path.display().to_string(),
+        selected_count,
+        skipped_count,
+        decisions,
+    };
+    write_json(&decision_path, &decision_report)?;
+
+    println!("Review decisions: {}", decision_path.display());
+    Ok(ReviewSessionOutcome {
+        selected: selected_count,
+        skipped: skipped_count,
+        cancelled,
+    })
+}
+
+fn discover_review_reports(directory: &Path) -> Result<Vec<ReviewReportOption>> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Could not read {}", directory.display()));
+        }
+    };
+
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.with_context(|| format!("Could not read an entry in {}", directory.display()))?;
+        let path = entry.path();
+        if path.is_file()
+            && path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.ends_with("-tidal-review.json"))
+        {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+
+    let mut reports = Vec::new();
+    for path in paths {
+        let option = review_report_option(&path)?;
+        if option.review_count > 0 {
+            reports.push(option);
+        }
+    }
+    Ok(reports)
+}
+
+fn review_report_option(path: &Path) -> Result<ReviewReportOption> {
+    let report: ReviewReport = read_json(path, "review report")?;
+    if report.schema_version != 1 {
+        bail!(
+            "Unsupported review report schema version {} in {}; expected version 1",
+            report.schema_version,
+            path.display()
+        );
+    }
+
+    Ok(ReviewReportOption {
+        path: path.to_owned(),
+        playlist_name: report.source_playlist.name,
+        review_count: report.review_tracks.len(),
+    })
+}
+
+fn read_json<T>(path: &Path, description: &str) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let bytes = fs::read(path)
+        .with_context(|| format!("Could not read {description} {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("Invalid {description} JSON in {}", path.display()))
+}
+
+fn tidal_review_choices(result: &MatchResult) -> Vec<TidalReviewChoice> {
+    let mut choices = Vec::with_capacity(result.alternatives.len() + 2);
+    let mut identifiers = HashSet::new();
+
+    if let Some(candidate) = &result.best_candidate {
+        identifiers.insert(candidate.tidal_id.clone());
+        choices.push(TidalReviewChoice::Candidate {
+            candidate: candidate.clone(),
+            rank: 1,
+            score: result.score.unwrap_or_default(),
+            suggested: true,
+            version_conflict: result
+                .reasons
+                .iter()
+                .any(|reason| reason.to_ascii_lowercase().contains("conflict")),
+        });
+    }
+
+    for (index, alternative) in result.alternatives.iter().enumerate() {
+        if identifiers.insert(alternative.candidate.tidal_id.clone()) {
+            choices.push(TidalReviewChoice::Candidate {
+                candidate: alternative.candidate.clone(),
+                rank: index + 2,
+                score: alternative.score,
+                suggested: false,
+                version_conflict: alternative.version_conflict,
+            });
+        }
+    }
+
+    choices.push(TidalReviewChoice::Skip);
+    choices
+}
+
+fn existing_review_cursor(
+    choices: &[TidalReviewChoice],
+    decision: Option<&ReviewDecision>,
+) -> usize {
+    let Some(decision) = decision else {
+        return 0;
+    };
+
+    choices
+        .iter()
+        .position(|choice| match choice {
+            TidalReviewChoice::Skip => decision.action == ReviewDecisionAction::Skipped,
+            TidalReviewChoice::Candidate { candidate, .. } => decision
+                .selected_tidal_candidate
+                .as_ref()
+                .is_some_and(|selected| selected.tidal_id == candidate.tidal_id),
+        })
+        .unwrap_or(0)
+}
+
+fn decision_from_choice(track: &SourceTrack, choice: TidalReviewChoice) -> ReviewDecision {
+    let (action, rank, score, candidate) = match choice {
+        TidalReviewChoice::Candidate {
+            candidate,
+            rank,
+            score,
+            ..
+        } => (
+            ReviewDecisionAction::Selected,
+            Some(rank),
+            Some(score),
+            Some(candidate),
+        ),
+        TidalReviewChoice::Skip => (ReviewDecisionAction::Skipped, None, None, None),
+    };
+
+    ReviewDecision {
+        position: track.position,
+        spotify_id: track.spotify_id.clone(),
+        spotify_title: track.title.clone(),
+        spotify_artists: track.artists.clone(),
+        spotify_album: track.album.clone(),
+        action,
+        selected_candidate_rank: rank,
+        selected_machine_match_percentage: score,
+        selected_tidal_candidate: candidate,
+    }
+}
+
+fn load_existing_review_decisions(
+    path: &Path,
+    spotify_playlist_id: &str,
+    source_match_generated_at_unix: u64,
+) -> Result<BTreeMap<usize, ReviewDecision>> {
+    let report: ReviewDecisionReport = match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .with_context(|| format!("Invalid review decisions JSON in {}", path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Could not read {}", path.display()));
+        }
+    };
+
+    if report.schema_version != 1 {
+        bail!(
+            "Unsupported review decisions schema version {} in {}; expected version 1",
+            report.schema_version,
+            path.display()
+        );
+    }
+    if report.source_playlist.spotify_id != spotify_playlist_id {
+        bail!(
+            "Review decisions {} belong to a different Spotify playlist",
+            path.display()
+        );
+    }
+    if report.source_match_generated_at_unix != source_match_generated_at_unix {
+        eprintln!(
+            "Ignoring stale review decisions in {} because the match report was regenerated.",
+            path.display()
+        );
+        return Ok(BTreeMap::new());
+    }
+
+    Ok(report
+        .decisions
+        .into_iter()
+        .map(|decision| (decision.position, decision))
+        .collect())
+}
+
+fn format_duration(duration_ms: u64) -> String {
+    let total_seconds = duration_ms / 1_000;
+    format!("{}:{:02}", total_seconds / 60, total_seconds % 60)
 }
 
 fn spotify_selection_options(
@@ -1720,6 +2230,21 @@ fn default_review_report_path(match_report: &Path) -> PathBuf {
         .join(filename)
 }
 
+fn default_review_decisions_path(review_report: &Path) -> PathBuf {
+    let stem = review_report
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("tidal-review");
+    let filename = format!("{stem}-decisions.json");
+
+    review_report
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("data"))
+        .join(filename)
+}
+
 fn sanitize_filename(value: &str) -> String {
     let mut result = String::new();
     let mut previous_was_separator = false;
@@ -1995,11 +2520,16 @@ mod tests {
 
     use super::{
         SelectionMatchSummary, SelectionMatchTotals, SpotifyPlaylistsPage, SpotifySavedTracksPage,
-        SpotifySelectionOption, default_review_report_path, merge_unique_candidates,
-        non_exact_track_lines, parse_concurrency, restore_source_order, selection_match_totals,
-        spotify_offset_page_url, spotify_retry_delay, spotify_selection_options, terminal_safe,
+        SpotifySelectionOption, TidalReviewChoice, decision_from_choice,
+        default_review_decisions_path, default_review_report_path, existing_review_cursor,
+        format_duration, merge_unique_candidates, non_exact_track_lines, parse_concurrency,
+        restore_source_order, selection_match_totals, spotify_offset_page_url, spotify_retry_delay,
+        spotify_selection_options, terminal_safe, tidal_review_choices,
     };
-    use crate::model::{MatchResult, MatchStatus, SourceTrack, TidalTrackCandidate};
+    use crate::model::{
+        MatchResult, MatchStatus, ReviewDecisionAction, ScoredCandidate, SourceTrack,
+        TidalTrackCandidate,
+    };
 
     #[test]
     fn deserializes_current_user_playlists_page() {
@@ -2114,6 +2644,10 @@ mod tests {
             default_review_report_path(Path::new("data/custom-report.json")),
             PathBuf::from("data/custom-report-tidal-review.json")
         );
+        assert_eq!(
+            default_review_decisions_path(Path::new("data/liked-songs-tidal-review.json")),
+            PathBuf::from("data/liked-songs-tidal-review-decisions.json")
+        );
     }
 
     #[test]
@@ -2181,6 +2715,105 @@ mod tests {
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].title, "Primary");
         assert_eq!(candidates[1].tidal_id, "2");
+    }
+
+    #[test]
+    fn formats_review_candidates_with_useful_metadata() {
+        let choice = TidalReviewChoice::Candidate {
+            candidate: TidalTrackCandidate {
+                tidal_id: "tidal-1".to_owned(),
+                title: "Canción (En Vivo)".to_owned(),
+                version: Some("Live".to_owned()),
+                isrc: Some("PEABC2600001".to_owned()),
+                duration_ms: Some(201_000),
+                explicit: Some(false),
+                artists: vec!["Artista".to_owned()],
+                album: Some("Álbum TIDAL".to_owned()),
+            },
+            rank: 1,
+            score: 72,
+            suggested: true,
+            version_conflict: true,
+        };
+
+        let label = choice.to_string();
+        assert!(label.contains("[72%]"));
+        assert!(label.contains("Artista"));
+        assert!(label.contains("album: Álbum TIDAL"));
+        assert!(label.contains("3:21"));
+        assert!(label.contains("PEABC2600001"));
+        assert!(label.contains("suggested"));
+        assert!(label.contains("VERSION CONFLICT"));
+        assert_eq!(format_duration(65_999), "1:05");
+    }
+
+    #[test]
+    fn builds_deduplicated_review_choices_and_records_a_selection() {
+        let source = SourceTrack {
+            position: 3,
+            added_at: None,
+            spotify_id: Some("spotify-3".to_owned()),
+            spotify_uri: "spotify:track:spotify-3".to_owned(),
+            title: "Canción".to_owned(),
+            artists: vec!["Artista".to_owned()],
+            album: Some("Álbum".to_owned()),
+            duration_ms: 180_000,
+            isrc: None,
+            explicit: false,
+            is_local: false,
+        };
+        let candidate = |tidal_id: &str| TidalTrackCandidate {
+            tidal_id: tidal_id.to_owned(),
+            title: format!("TIDAL {tidal_id}"),
+            version: None,
+            isrc: None,
+            duration_ms: Some(180_000),
+            explicit: Some(false),
+            artists: vec!["Artista".to_owned()],
+            album: Some("Álbum".to_owned()),
+        };
+        let result = MatchResult {
+            spotify_track: source.clone(),
+            status: MatchStatus::Review,
+            best_candidate: Some(candidate("1")),
+            score: Some(75),
+            reasons: vec!["Ambiguous candidates".to_owned()],
+            alternatives: vec![
+                ScoredCandidate {
+                    candidate: candidate("1"),
+                    score: 74,
+                    reasons: Vec::new(),
+                    version_conflict: false,
+                },
+                ScoredCandidate {
+                    candidate: candidate("2"),
+                    score: 70,
+                    reasons: Vec::new(),
+                    version_conflict: false,
+                },
+            ],
+            search_query: "Canción Artista".to_owned(),
+            error: None,
+        };
+
+        let choices = tidal_review_choices(&result);
+        assert_eq!(choices.len(), 3);
+        let selected_choice = choices[1].clone();
+        let decision = decision_from_choice(&source, selected_choice);
+        assert_eq!(decision.action, ReviewDecisionAction::Selected);
+        assert_eq!(decision.selected_candidate_rank, Some(3));
+        assert_eq!(
+            decision
+                .selected_tidal_candidate
+                .as_ref()
+                .map(|candidate| candidate.tidal_id.as_str()),
+            Some("2")
+        );
+        assert_eq!(existing_review_cursor(&choices, Some(&decision)), 1);
+
+        let skip = decision_from_choice(&source, TidalReviewChoice::Skip);
+        assert_eq!(skip.action, ReviewDecisionAction::Skipped);
+        assert_eq!(existing_review_cursor(&choices, Some(&skip)), 2);
     }
 
     #[test]

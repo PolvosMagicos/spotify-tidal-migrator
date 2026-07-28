@@ -166,6 +166,38 @@ pub struct ReviewTrack {
     pub reasons: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReviewDecisionReport {
+    pub schema_version: u8,
+    pub generated_at_unix: u64,
+    pub source_playlist: ExportedPlaylistMetadata,
+    pub source_match_report: String,
+    pub source_match_generated_at_unix: u64,
+    pub source_review_report: String,
+    pub selected_count: usize,
+    pub skipped_count: usize,
+    pub decisions: Vec<ReviewDecision>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReviewDecisionAction {
+    Selected,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewDecision {
+    pub position: usize,
+    pub spotify_id: Option<String>,
+    pub spotify_title: String,
+    pub spotify_artists: Vec<String>,
+    pub spotify_album: Option<String>,
+    pub action: ReviewDecisionAction,
+    pub selected_candidate_rank: Option<usize>,
+    pub selected_machine_match_percentage: Option<u8>,
+    pub selected_tidal_candidate: Option<TidalTrackCandidate>,
+}
+
 impl ReviewReport {
     pub fn from_match_report(report: &MatchReport, source_match_report: String) -> Self {
         let review_tracks = report
@@ -206,7 +238,8 @@ impl ReviewReport {
 mod tests {
     use super::{
         ExportedPlaylistMetadata, MatchReport, MatchResult, MatchStatus, MatchSummary,
-        ReviewReport, SourceTrack, SpotifyPlaylistExport, TidalTrackCandidate,
+        ReviewDecisionAction, ReviewDecisionReport, ReviewReport, SourceTrack,
+        SpotifyPlaylistExport, TidalTrackCandidate,
     };
 
     #[test]
@@ -315,5 +348,42 @@ mod tests {
         assert_eq!(track.tidal_title.as_deref(), Some("Canción TIDAL 2"));
         assert_eq!(track.tidal_artists, ["Artista TIDAL"]);
         assert_eq!(track.tidal_album.as_deref(), Some("Álbum de TIDAL"));
+    }
+
+    #[test]
+    fn deserializes_review_decisions_for_a_specific_match_run() {
+        let json = r#"{
+          "schema_version": 1,
+          "generated_at_unix": 1700000100,
+          "source_playlist": {
+            "spotify_id": "playlist",
+            "name": "Lista",
+            "description": null,
+            "spotify_url": null,
+            "snapshot_id": "snapshot",
+            "total_reported_by_spotify": 1
+          },
+          "source_match_report": "data/lista-tidal-matches.json",
+          "source_match_generated_at_unix": 1700000000,
+          "source_review_report": "data/lista-tidal-review.json",
+          "selected_count": 0,
+          "skipped_count": 1,
+          "decisions": [{
+            "position": 1,
+            "spotify_id": "spotify-1",
+            "spotify_title": "Canción",
+            "spotify_artists": ["Artista"],
+            "spotify_album": "Álbum",
+            "action": "Skipped",
+            "selected_candidate_rank": null,
+            "selected_machine_match_percentage": null,
+            "selected_tidal_candidate": null
+          }]
+        }"#;
+
+        let report: ReviewDecisionReport = serde_json::from_str(json).unwrap();
+        assert_eq!(report.source_match_generated_at_unix, 1_700_000_000);
+        assert_eq!(report.decisions.len(), 1);
+        assert_eq!(report.decisions[0].action, ReviewDecisionAction::Skipped);
     }
 }

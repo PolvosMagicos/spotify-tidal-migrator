@@ -2,6 +2,8 @@
 
 Discovery date: 2026-07-16
 
+Last revalidated: 2026-07-28
+
 Status: **blocked for ordinary third-party applications**. No playlist mutation
 code is implemented or invoked in this repository.
 
@@ -21,8 +23,9 @@ code is implemented or invoked in this repository.
 - TIDAL's statement that only `openapi.tidal.com` is authorized for third-party
   use: <https://github.com/orgs/tidal-music/discussions/38>
 
-The OpenAPI file retrieved during discovery reported version `1.10.65` and
-SHA-256 `95dd077117a9ad81730a7ebe6ec7eac94a58ca1700d1578a1157b974b1919d25`.
+The OpenAPI file retrieved during the latest revalidation reported version
+`1.10.74` and SHA-256
+`d738d1aa2949b28a873a9e239567d4aae238daed6f01e281754aab1aa0d43a83`.
 The API is versioned independently and must be checked again before unblocking
 mutations.
 
@@ -133,6 +136,13 @@ enable an `INTERNAL` scope. Until TIDAL removes the internal scope requirement,
 publishes that it is implicitly granted, or enables it for this app in the
 dashboard, the required authorization is not fully available and mutation must
 remain blocked.
+
+The local application configuration checked during the 2026-07-28
+revalidation requests the public `playlists.write` scope but does not request
+the internal `w_usr` scope. OAuth cannot grant an unrequested scope, and the
+official dashboard does not expose `w_usr` as an ordinary third-party scope.
+Consequently, both official mutation requests would fail authorization for the
+currently configured app.
 
 `TIDAL_SCOPES` is intentionally user-configured. No unverified scope is
 hardcoded. The user authorization implementation rejects an empty setting and

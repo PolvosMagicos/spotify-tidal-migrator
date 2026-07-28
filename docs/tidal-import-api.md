@@ -201,6 +201,22 @@ imports each successful source using its original Spotify name. Without
 `--apply`, the entire command stops at import-plan reports and makes no TIDAL
 mutation.
 
+Interactive review can also be run separately:
+
+```bash
+cargo run -- review
+```
+
+Confirmed per-playlist decisions remain in
+`data/<playlist>-tidal-review-decisions.json`. Confirmed manual track selections
+are additionally cached in `data/tidal-review-choice-cache.json`, keyed by
+country code and Spotify track ID, so the same song can be reused in another
+playlist without repeating the choice. A cached selection is removed if that
+song is later marked Skip. The review UI prints a complete decision summary and
+requires confirmation before saving. Press Esc during a song prompt to return
+to the previous song; at the first song, Esc cancels without replacing saved
+decisions.
+
 Dry run:
 
 ```bash

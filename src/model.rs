@@ -198,6 +198,24 @@ pub struct ReviewDecision {
     pub selected_tidal_candidate: Option<TidalTrackCandidate>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReviewChoiceCache {
+    pub schema_version: u8,
+    pub updated_at_unix: u64,
+    pub choices: Vec<ReviewChoiceCacheEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewChoiceCacheEntry {
+    pub country_code: String,
+    pub spotify_id: String,
+    pub spotify_title: String,
+    pub spotify_artists: Vec<String>,
+    pub spotify_album: Option<String>,
+    pub selected_machine_match_percentage: Option<u8>,
+    pub selected_tidal_candidate: TidalTrackCandidate,
+}
+
 impl ReviewReport {
     pub fn from_match_report(report: &MatchReport, source_match_report: String) -> Self {
         let review_tracks = report
@@ -238,8 +256,8 @@ impl ReviewReport {
 mod tests {
     use super::{
         ExportedPlaylistMetadata, MatchReport, MatchResult, MatchStatus, MatchSummary,
-        ReviewDecisionAction, ReviewDecisionReport, ReviewReport, SourceTrack,
-        SpotifyPlaylistExport, TidalTrackCandidate,
+        ReviewChoiceCache, ReviewChoiceCacheEntry, ReviewDecisionAction, ReviewDecisionReport,
+        ReviewReport, SourceTrack, SpotifyPlaylistExport, TidalTrackCandidate,
     };
 
     #[test]
@@ -385,5 +403,39 @@ mod tests {
         assert_eq!(report.source_match_generated_at_unix, 1_700_000_000);
         assert_eq!(report.decisions.len(), 1);
         assert_eq!(report.decisions[0].action, ReviewDecisionAction::Skipped);
+    }
+
+    #[test]
+    fn review_choice_cache_round_trips_selected_candidate_metadata() {
+        let cache = ReviewChoiceCache {
+            schema_version: 1,
+            updated_at_unix: 1_700_000_100,
+            choices: vec![ReviewChoiceCacheEntry {
+                country_code: "PE".to_owned(),
+                spotify_id: "spotify-1".to_owned(),
+                spotify_title: "Canción".to_owned(),
+                spotify_artists: vec!["Artista".to_owned()],
+                spotify_album: Some("Álbum".to_owned()),
+                selected_machine_match_percentage: Some(74),
+                selected_tidal_candidate: TidalTrackCandidate {
+                    tidal_id: "tidal-1".to_owned(),
+                    title: "Canción TIDAL".to_owned(),
+                    version: None,
+                    isrc: Some("PEABC2600001".to_owned()),
+                    duration_ms: Some(180_000),
+                    explicit: Some(false),
+                    artists: vec!["Artista".to_owned()],
+                    album: Some("Álbum TIDAL".to_owned()),
+                },
+            }],
+        };
+
+        let json = serde_json::to_string(&cache).unwrap();
+        let parsed: ReviewChoiceCache = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.choices[0].spotify_id, "spotify-1");
+        assert_eq!(
+            parsed.choices[0].selected_tidal_candidate.tidal_id,
+            "tidal-1"
+        );
     }
 }

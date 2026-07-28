@@ -166,7 +166,12 @@ URL or refresh request.
 - Probable matches require `--include-probable`.
 - Review matches require both `--include-review` and a persisted manual
   `Selected` review decision.
-- Missing, local, failed-search, and unresolved conflict results are skipped.
+- A `Missing` result caused by no acceptable catalog match is available in the
+  Review flow. It can only be resolved with a verified manual TIDAL track ID or
+  explicitly skipped; weak automatic candidates are not offered. The selected
+  track still requires `--include-review` during import.
+- Local tracks, failed searches, unresolved conflicts, and Missing tracks
+  without a confirmed manual selection are always skipped.
 - Creation and every batch use stable idempotency keys.
 - Import state is atomically replaced before and after every batch.
 - A pending batch is reconciled against the remote ordered prefix on resume.
@@ -220,7 +225,9 @@ to the previous song; at the first song, Esc cancels without replacing saved
 decisions. The `Enter a TIDAL track ID` option resolves the ID through the
 official `GET /tracks/{id}` endpoint with `countryCode` and
 `include=albums,artists`, displays the returned metadata, and requires a
-separate confirmation before recording it as the manual selection.
+separate confirmation before recording it as the manual selection. Tracks
+classified as `Missing` because there was no acceptable TIDAL match are included
+in this flow and show only `Enter a TIDAL track ID`, `Skip`, and `Finish`.
 
 Dry run:
 

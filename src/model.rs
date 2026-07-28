@@ -112,6 +112,15 @@ pub struct MatchResult {
     pub error: Option<String>,
 }
 
+impl MatchResult {
+    pub fn is_reviewable(&self) -> bool {
+        self.status == MatchStatus::Review
+            || (self.status == MatchStatus::Missing
+                && self.error.is_none()
+                && !self.spotify_track.is_local)
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct MatchSummary {
     pub exact: usize,
@@ -158,6 +167,8 @@ pub struct ReviewTrack {
     pub spotify_title: String,
     pub spotify_artists: Vec<String>,
     pub spotify_album: Option<String>,
+    #[serde(default = "default_review_match_status")]
+    pub source_match_status: MatchStatus,
     pub match_percentage: u8,
     pub tidal_id: Option<String>,
     pub tidal_title: Option<String>,
@@ -221,7 +232,7 @@ impl ReviewReport {
         let review_tracks = report
             .results
             .iter()
-            .filter(|result| result.status == MatchStatus::Review)
+            .filter(|result| result.is_reviewable())
             .map(|result| {
                 let candidate = result.best_candidate.as_ref();
                 ReviewTrack {
@@ -230,6 +241,7 @@ impl ReviewReport {
                     spotify_title: result.spotify_track.title.clone(),
                     spotify_artists: result.spotify_track.artists.clone(),
                     spotify_album: result.spotify_track.album.clone(),
+                    source_match_status: result.status,
                     match_percentage: result.score.unwrap_or_default(),
                     tidal_id: candidate.map(|item| item.tidal_id.clone()),
                     tidal_title: candidate.map(|item| item.title.clone()),
@@ -250,6 +262,10 @@ impl ReviewReport {
             review_tracks,
         }
     }
+}
+
+fn default_review_match_status() -> MatchStatus {
+    MatchStatus::Review
 }
 
 #[cfg(test)]
@@ -296,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn review_report_contains_only_review_tracks_with_source_and_candidate_metadata() {
+    fn review_report_contains_review_and_safe_missing_tracks() {
         let result = |position, status, score| MatchResult {
             spotify_track: SourceTrack {
                 position,
@@ -328,6 +344,8 @@ mod tests {
             search_query: "query".to_owned(),
             error: None,
         };
+        let mut failed_missing = result(4, MatchStatus::Missing, 0);
+        failed_missing.error = Some("temporary catalog failure".to_owned());
         let report = MatchReport {
             schema_version: 1,
             generated_at_unix: 1_700_000_000,
@@ -337,28 +355,31 @@ mod tests {
                 description: None,
                 spotify_url: None,
                 snapshot_id: "snapshot".to_owned(),
-                total_reported_by_spotify: 2,
+                total_reported_by_spotify: 4,
             },
             country_code: "PE".to_owned(),
-            processed_tracks: 2,
+            processed_tracks: 4,
             summary: MatchSummary {
                 exact: 1,
                 probable: 0,
                 review: 1,
-                missing: 0,
+                missing: 2,
             },
             results: vec![
                 result(1, MatchStatus::Exact, 100),
                 result(2, MatchStatus::Review, 72),
+                result(3, MatchStatus::Missing, 40),
+                failed_missing,
             ],
         };
 
         let review =
             ReviewReport::from_match_report(&report, "data/lista-tidal-matches.json".to_owned());
 
-        assert_eq!(review.review_tracks.len(), 1);
+        assert_eq!(review.review_tracks.len(), 2);
         let track = &review.review_tracks[0];
         assert_eq!(track.position, 2);
+        assert_eq!(track.source_match_status, MatchStatus::Review);
         assert_eq!(track.spotify_title, "Canción 2");
         assert_eq!(track.spotify_artists, ["Artista"]);
         assert_eq!(track.spotify_album.as_deref(), Some("Álbum de Spotify"));
@@ -366,6 +387,11 @@ mod tests {
         assert_eq!(track.tidal_title.as_deref(), Some("Canción TIDAL 2"));
         assert_eq!(track.tidal_artists, ["Artista TIDAL"]);
         assert_eq!(track.tidal_album.as_deref(), Some("Álbum de TIDAL"));
+
+        let missing = &review.review_tracks[1];
+        assert_eq!(missing.position, 3);
+        assert_eq!(missing.source_match_status, MatchStatus::Missing);
+        assert_eq!(missing.match_percentage, 40);
     }
 
     #[test]

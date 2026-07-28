@@ -1057,7 +1057,7 @@ async fn review_one_report(
     let review_results: Vec<_> = match_report
         .results
         .iter()
-        .filter(|result| result.status == MatchStatus::Review)
+        .filter(|result| result.is_reviewable())
         .collect();
     let decision_path = default_review_decisions_path(path);
     let mut decisions = load_existing_review_decisions(
@@ -1127,6 +1127,9 @@ async fn review_one_report(
                     .score
                     .map_or_else(|| "no score".to_owned(), |score| format!("{score}%"))
             );
+            if result.status == MatchStatus::Missing {
+                println!("No acceptable automatic TIDAL match; enter a track ID manually or Skip.");
+            }
             for reason in &result.reasons {
                 println!("  - {}", terminal_safe(reason));
             }
@@ -1299,10 +1302,32 @@ fn review_report_option(path: &Path) -> Result<ReviewReportOption> {
         );
     }
 
+    let match_report_path = PathBuf::from(&report.source_match_report);
+    let match_report: MatchReport =
+        read_json(&match_report_path, "match report").with_context(|| {
+            format!(
+                "The review report {} references {}",
+                path.display(),
+                match_report_path.display()
+            )
+        })?;
+    if match_report.source_playlist.spotify_id != report.source_playlist.spotify_id {
+        bail!(
+            "Review report {} and match report {} refer to different Spotify playlists",
+            path.display(),
+            match_report_path.display()
+        );
+    }
+    let review_count = match_report
+        .results
+        .iter()
+        .filter(|result| result.is_reviewable())
+        .count();
+
     Ok(ReviewReportOption {
         path: path.to_owned(),
         playlist_name: report.source_playlist.name,
-        review_count: report.review_tracks.len(),
+        review_count,
     })
 }
 
@@ -1320,29 +1345,31 @@ fn tidal_review_choices(result: &MatchResult) -> Vec<TidalReviewChoice> {
     let mut choices = Vec::with_capacity(result.alternatives.len() + 4);
     let mut identifiers = HashSet::new();
 
-    if let Some(candidate) = &result.best_candidate {
-        identifiers.insert(candidate.tidal_id.clone());
-        choices.push(TidalReviewChoice::Candidate {
-            candidate: candidate.clone(),
-            rank: 1,
-            score: result.score.unwrap_or_default(),
-            suggested: true,
-            version_conflict: result
-                .reasons
-                .iter()
-                .any(|reason| reason.to_ascii_lowercase().contains("conflict")),
-        });
-    }
-
-    for (index, alternative) in result.alternatives.iter().enumerate() {
-        if identifiers.insert(alternative.candidate.tidal_id.clone()) {
+    if result.status == MatchStatus::Review {
+        if let Some(candidate) = &result.best_candidate {
+            identifiers.insert(candidate.tidal_id.clone());
             choices.push(TidalReviewChoice::Candidate {
-                candidate: alternative.candidate.clone(),
-                rank: index + 2,
-                score: alternative.score,
-                suggested: false,
-                version_conflict: alternative.version_conflict,
+                candidate: candidate.clone(),
+                rank: 1,
+                score: result.score.unwrap_or_default(),
+                suggested: true,
+                version_conflict: result
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.to_ascii_lowercase().contains("conflict")),
             });
+        }
+
+        for (index, alternative) in result.alternatives.iter().enumerate() {
+            if identifiers.insert(alternative.candidate.tidal_id.clone()) {
+                choices.push(TidalReviewChoice::Candidate {
+                    candidate: alternative.candidate.clone(),
+                    rank: index + 2,
+                    score: alternative.score,
+                    suggested: false,
+                    version_conflict: alternative.version_conflict,
+                });
+            }
         }
     }
 
@@ -3523,6 +3550,53 @@ mod tests {
     }
 
     #[test]
+    fn missing_tracks_only_offer_manual_id_skip_or_finish() {
+        let candidate = |tidal_id: &str| TidalTrackCandidate {
+            tidal_id: tidal_id.to_owned(),
+            title: format!("TIDAL {tidal_id}"),
+            version: None,
+            isrc: None,
+            duration_ms: Some(180_000),
+            explicit: Some(false),
+            artists: vec!["Artista".to_owned()],
+            album: Some("Álbum".to_owned()),
+        };
+        let result = MatchResult {
+            spotify_track: SourceTrack {
+                position: 1,
+                added_at: None,
+                spotify_id: Some("spotify-1".to_owned()),
+                spotify_uri: "spotify:track:spotify-1".to_owned(),
+                title: "Sin coincidencia".to_owned(),
+                artists: vec!["Artista".to_owned()],
+                album: Some("Álbum".to_owned()),
+                duration_ms: 180_000,
+                isrc: None,
+                explicit: false,
+                is_local: false,
+            },
+            status: MatchStatus::Missing,
+            best_candidate: Some(candidate("weak-best")),
+            score: Some(40),
+            reasons: vec!["No acceptable TIDAL match".to_owned()],
+            alternatives: vec![ScoredCandidate {
+                candidate: candidate("weak-alternative"),
+                score: 35,
+                reasons: Vec::new(),
+                version_conflict: false,
+            }],
+            search_query: "Sin coincidencia Artista".to_owned(),
+            error: None,
+        };
+
+        let choices = tidal_review_choices(&result);
+        assert_eq!(choices.len(), 3);
+        assert!(matches!(choices[0], TidalReviewChoice::ManualTrackId));
+        assert!(matches!(choices[1], TidalReviewChoice::Skip));
+        assert!(matches!(choices[2], TidalReviewChoice::Finish));
+    }
+
+    #[test]
     fn reuses_confirmed_review_choices_across_playlists_and_country() {
         let candidate = TidalTrackCandidate {
             tidal_id: "tidal-1".to_owned(),
@@ -3599,6 +3673,64 @@ mod tests {
         );
         update_review_choice_cache("PE", &[&first], &first_decisions, &mut cache).unwrap();
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn caches_manual_track_id_for_missing_song_across_playlists() {
+        let candidate = TidalTrackCandidate {
+            tidal_id: "manual-tidal-id".to_owned(),
+            title: "Canción TIDAL".to_owned(),
+            version: None,
+            isrc: None,
+            duration_ms: Some(180_000),
+            explicit: Some(false),
+            artists: vec!["Artista".to_owned()],
+            album: Some("Álbum TIDAL".to_owned()),
+        };
+        let result = |position| MatchResult {
+            spotify_track: SourceTrack {
+                position,
+                added_at: None,
+                spotify_id: Some("spotify-missing".to_owned()),
+                spotify_uri: "spotify:track:spotify-missing".to_owned(),
+                title: "Canción sin coincidencia".to_owned(),
+                artists: vec!["Artista".to_owned()],
+                album: Some("Álbum".to_owned()),
+                duration_ms: 180_000,
+                isrc: None,
+                explicit: false,
+                is_local: false,
+            },
+            status: MatchStatus::Missing,
+            best_candidate: None,
+            score: Some(40),
+            reasons: vec!["No acceptable TIDAL match".to_owned()],
+            alternatives: Vec::new(),
+            search_query: "Canción sin coincidencia Artista".to_owned(),
+            error: None,
+        };
+
+        let first = result(4);
+        let manual = decision_from_manual_candidate(&first.spotify_track, candidate);
+        let first_decisions = BTreeMap::from([(4, manual)]);
+        let mut cache = BTreeMap::new();
+        update_review_choice_cache("PE", &[&first], &first_decisions, &mut cache).unwrap();
+
+        let second = result(12);
+        let mut second_decisions = BTreeMap::new();
+        assert_eq!(
+            apply_cached_review_choices("PE", &[&second], &mut second_decisions, &cache),
+            1
+        );
+        let reused = &second_decisions[&12];
+        assert_eq!(reused.selected_candidate_rank, None);
+        assert_eq!(
+            reused
+                .selected_tidal_candidate
+                .as_ref()
+                .map(|item| item.tidal_id.as_str()),
+            Some("manual-tidal-id")
+        );
     }
 
     #[test]

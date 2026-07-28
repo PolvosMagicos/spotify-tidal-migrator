@@ -67,6 +67,10 @@ pub struct ImportSelectionSummary {
     pub exact_included: usize,
     pub probable_included: usize,
     pub review_included: usize,
+
+    #[serde(default)]
+    pub missing_included: usize,
+
     pub probable_skipped: usize,
     pub review_skipped: usize,
     pub missing_skipped: usize,
@@ -528,6 +532,28 @@ fn build_import_plan(
                 ));
                 None
             }
+            MatchStatus::Missing if include_review => match decision_map.get(&position) {
+                Some(decision) if decision.action == ReviewDecisionAction::Selected => {
+                    let candidate = decision
+                        .selected_tidal_candidate
+                        .as_ref()
+                        .context("A selected Missing decision has no TIDAL candidate")?;
+                    validate_tidal_candidate(candidate)?;
+                    summary.missing_included += 1;
+                    Some((candidate, true))
+                }
+                Some(_) => {
+                    summary.missing_skipped += 1;
+                    skipped_tracks.push(skip("Missing track was explicitly skipped during Review"));
+                    None
+                }
+                None => {
+                    summary.missing_skipped += 1;
+                    skipped_tracks
+                        .push(skip("No acceptable TIDAL match or manual track selection"));
+                    None
+                }
+            },
             MatchStatus::Missing => {
                 summary.missing_skipped += 1;
                 skipped_tracks.push(skip("No acceptable TIDAL match"));
@@ -634,12 +660,21 @@ fn validate_review_decisions<'a>(
                     decision.position
                 )
             })?;
-        if result.status != MatchStatus::Review
+        if !result.is_reviewable()
             || result.spotify_track.spotify_id != decision.spotify_id
             || result.spotify_track.title != decision.spotify_title
         {
             bail!(
-                "Review decision at source position {} does not match the Review result",
+                "Review decision at source position {} does not match a reviewable result",
+                decision.position
+            );
+        }
+        if result.status == MatchStatus::Missing
+            && decision.action == ReviewDecisionAction::Selected
+            && decision.selected_candidate_rank.is_some()
+        {
+            bail!(
+                "Selected Missing decision at source position {} must come from a manual TIDAL track ID",
                 decision.position
             );
         }
@@ -946,6 +981,10 @@ fn print_preflight(plan: &ImportPlan, dry_run: bool) {
     println!("Exact selected: {}", plan.selection.exact_included);
     println!("Probable selected: {}", plan.selection.probable_included);
     println!("Review selected: {}", plan.selection.review_included);
+    println!(
+        "Missing manually selected: {}",
+        plan.selection.missing_included
+    );
     println!("Probable skipped: {}", plan.selection.probable_skipped);
     println!("Review skipped: {}", plan.selection.review_skipped);
     println!("Missing skipped: {}", plan.selection.missing_skipped);
@@ -1224,6 +1263,20 @@ mod tests {
         }
     }
 
+    fn manual_missing_decision() -> ReviewDecision {
+        ReviewDecision {
+            position: 4,
+            spotify_id: Some("spotify-4".to_owned()),
+            spotify_title: "Canción 4".to_owned(),
+            spotify_artists: vec!["Artista".to_owned()],
+            spotify_album: Some("Álbum".to_owned()),
+            action: ReviewDecisionAction::Selected,
+            selected_candidate_rank: None,
+            selected_machine_match_percentage: None,
+            selected_tidal_candidate: Some(candidate("manual-missing")),
+        }
+    }
+
     #[test]
     fn exact_only_is_the_default_selection() {
         let plan = build_import_plan(
@@ -1276,6 +1329,79 @@ mod tests {
             ["tidal-1", "tidal-2", "review-choice"]
         );
         assert!(plan.selected_tracks[2].selected_by_review);
+    }
+
+    #[test]
+    fn manually_resolved_missing_track_requires_include_review() {
+        let report = report();
+        let mut decisions = decisions();
+        decisions.decisions.push(manual_missing_decision());
+        decisions.selected_count += 1;
+
+        let excluded = build_import_plan(
+            &report,
+            Path::new("data/report.json"),
+            Some(&decisions),
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(excluded.selected_tracks.len(), 1);
+        assert_eq!(excluded.selection.missing_included, 0);
+        assert_eq!(excluded.selection.missing_skipped, 1);
+
+        let included = build_import_plan(
+            &report,
+            Path::new("data/report.json"),
+            Some(&decisions),
+            None,
+            None,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            included
+                .selected_tracks
+                .iter()
+                .map(|track| track.tidal_id.as_str())
+                .collect::<Vec<_>>(),
+            ["tidal-1", "review-choice", "manual-missing"]
+        );
+        assert_eq!(included.selection.missing_included, 1);
+        assert_eq!(included.selection.missing_skipped, 0);
+        assert!(included.selected_tracks[2].selected_by_review);
+        assert_eq!(
+            included.selected_tracks[2].source_match_status,
+            MatchStatus::Missing
+        );
+    }
+
+    #[test]
+    fn missing_selection_cannot_claim_an_automatic_candidate_rank() {
+        let report = report();
+        let mut decisions = decisions();
+        let mut missing = manual_missing_decision();
+        missing.selected_candidate_rank = Some(1);
+        decisions.decisions.push(missing);
+
+        let error = build_import_plan(
+            &report,
+            Path::new("data/report.json"),
+            Some(&decisions),
+            None,
+            None,
+            true,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must come from a manual TIDAL track ID")
+        );
     }
 
     #[test]

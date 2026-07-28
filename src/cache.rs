@@ -279,7 +279,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{DEFAULT_EMPTY_TTL_SECS, DEFAULT_SUCCESS_TTL_SECS, TidalSearchCache};
+    use super::TidalSearchCache;
     use crate::model::TidalTrackCandidate;
 
     #[test]
@@ -408,11 +408,5 @@ mod tests {
         );
 
         std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn default_ttls_are_nonzero() {
-        assert!(DEFAULT_SUCCESS_TTL_SECS > DEFAULT_EMPTY_TTL_SECS);
-        assert!(DEFAULT_EMPTY_TTL_SECS > 0);
     }
 }

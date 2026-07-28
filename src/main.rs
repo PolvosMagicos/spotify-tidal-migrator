@@ -102,6 +102,41 @@ enum Command {
         fallback_searches: bool,
     },
 
+    /// Select, export, match, review, and import Spotify sources in one invocation.
+    Migrate {
+        /// Maximum simultaneous Spotify page and TIDAL catalog requests.
+        #[arg(long, default_value_t = 4, value_parser = parse_concurrency)]
+        concurrency: usize,
+
+        /// Maximum sustained TIDAL catalog search starts per second.
+        #[arg(long, value_parser = tidal::parse_rate_limit)]
+        rate_limit: Option<f64>,
+
+        /// Ignore cached TIDAL searches and replace them with fresh responses.
+        #[arg(long)]
+        refresh_cache: bool,
+
+        /// Retry Review/Missing tracks using album-context and title-only searches.
+        #[arg(long)]
+        fallback_searches: bool,
+
+        /// Complete the workflow without creating or modifying a TIDAL playlist.
+        #[arg(long, conflicts_with = "apply")]
+        dry_run: bool,
+
+        /// Explicitly create and populate the selected TIDAL playlists.
+        #[arg(long, conflicts_with = "dry_run")]
+        apply: bool,
+
+        /// Include matches classified as Probable.
+        #[arg(long)]
+        include_probable: bool,
+
+        /// Interactively review and include explicitly selected Review matches.
+        #[arg(long)]
+        include_review: bool,
+    },
+
     /// Match tracks from a Spotify export against the public TIDAL catalog.
     MatchTidal {
         /// Spotify playlist export JSON created by export-spotify.
@@ -425,6 +460,28 @@ async fn main() -> Result<()> {
             select_spotify_playlists(concurrency, rate_limit, refresh_cache, fallback_searches)
                 .await
         }
+        Command::Migrate {
+            concurrency,
+            rate_limit,
+            refresh_cache,
+            fallback_searches,
+            dry_run,
+            apply,
+            include_probable,
+            include_review,
+        } => {
+            migrate_spotify_sources(MigrateOptions {
+                concurrency,
+                rate_limit,
+                refresh_cache,
+                fallback_searches,
+                dry_run,
+                apply,
+                include_probable,
+                include_review,
+            })
+            .await
+        }
         Command::MatchTidal {
             input,
             limit,
@@ -482,6 +539,133 @@ async fn select_spotify_playlists(
     refresh_cache: bool,
     fallback_searches: bool,
 ) -> Result<()> {
+    let summaries =
+        prepare_spotify_sources(concurrency, rate_limit, refresh_cache, fallback_searches).await?;
+    if !summaries.is_empty() {
+        println!("No TIDAL import was performed.");
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct MigrateOptions {
+    concurrency: usize,
+    rate_limit: Option<f64>,
+    refresh_cache: bool,
+    fallback_searches: bool,
+    dry_run: bool,
+    apply: bool,
+    include_probable: bool,
+    include_review: bool,
+}
+
+async fn migrate_spotify_sources(options: MigrateOptions) -> Result<()> {
+    if options.apply && options.dry_run {
+        bail!("--apply and --dry-run cannot be used together");
+    }
+
+    println!(
+        "Full migration mode: {}",
+        if options.apply {
+            "apply"
+        } else {
+            "dry run (no TIDAL mutations)"
+        }
+    );
+    if options.apply {
+        println!("Validating TIDAL user authorization before matching...");
+        let user_client = tidal_user::TidalUserClient::from_env().await?;
+        user_client.require_scope("playlists.write")?;
+        println!("TIDAL playlist-write authorization is ready.");
+    }
+    let summaries = prepare_spotify_sources(
+        options.concurrency,
+        options.rate_limit,
+        options.refresh_cache,
+        options.fallback_searches,
+    )
+    .await?;
+    if summaries.is_empty() {
+        return Ok(());
+    }
+
+    if options.include_review {
+        for summary in &summaries {
+            if summary.failure.is_some() || summary.review == 0 {
+                continue;
+            }
+            let review_path = summary
+                .review_report_path
+                .as_deref()
+                .context("A matched source has no Review report path")?;
+            let outcome = review_one_report(review_path)?;
+            if outcome.cancelled {
+                bail!(
+                    "Migration cancelled during Review; no TIDAL import was started. \
+                     Saved decisions can be continued with `cargo run -- review`."
+                );
+            }
+        }
+    }
+
+    println!();
+    println!("Starting TIDAL import stage...");
+    let mut imported_sources = 0_usize;
+    let mut failed_sources = Vec::new();
+    for summary in &summaries {
+        let Some(match_report) = summary.report_path.as_deref() else {
+            if summary.failure.is_some() {
+                failed_sources.push(summary.source_name.clone());
+            }
+            continue;
+        };
+
+        println!();
+        println!("Importing source: {}", terminal_safe(&summary.source_name));
+        tidal_import::run_import(
+            match_report,
+            tidal_import::ImportCommandOptions {
+                name: None,
+                description: None,
+                dry_run: options.dry_run,
+                apply: options.apply,
+                include_review: options.include_review,
+                include_probable: options.include_probable,
+                resume: false,
+                output: None,
+            },
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "Could not import Spotify source {}",
+                terminal_safe(&summary.source_name)
+            )
+        })?;
+        imported_sources += 1;
+    }
+
+    println!();
+    println!(
+        "Full migration flow completed for {imported_sources} source(s) in {} mode.",
+        if options.apply { "apply" } else { "dry-run" }
+    );
+    if !failed_sources.is_empty() {
+        bail!(
+            "{} Spotify source(s) failed before import: {}",
+            failed_sources.len(),
+            failed_sources.join(", ")
+        );
+    }
+    Ok(())
+}
+
+async fn prepare_spotify_sources(
+    concurrency: usize,
+    rate_limit: Option<f64>,
+    refresh_cache: bool,
+    fallback_searches: bool,
+) -> Result<Vec<SelectionMatchSummary>> {
     let token = valid_spotify_token().await?;
     let client = Client::new();
     let mut liked_songs_url = Url::parse(&format!("{SPOTIFY_API_URL}/me/tracks"))?;
@@ -527,12 +711,12 @@ async fn select_spotify_playlists(
 
     let Some(selected) = selected else {
         println!("Playlist selection cancelled.");
-        return Ok(());
+        return Ok(Vec::new());
     };
 
     if selected.is_empty() {
         println!("No playlists selected.");
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     println!();
@@ -609,8 +793,7 @@ async fn select_spotify_playlists(
     }
 
     print_selection_match_summary(&summaries);
-    println!("No TIDAL import was performed.");
-    Ok(())
+    Ok(summaries)
 }
 
 #[derive(Debug, Clone)]
@@ -2583,9 +2766,11 @@ fn random_string(length: usize) -> String {
 mod tests {
     use std::path::{Path, PathBuf};
 
+    use clap::Parser;
+
     use super::{
-        SelectionMatchSummary, SelectionMatchTotals, SpotifyPlaylistsPage, SpotifySavedTracksPage,
-        SpotifySelectionOption, TidalReviewChoice, decision_from_choice,
+        Cli, Command, SelectionMatchSummary, SelectionMatchTotals, SpotifyPlaylistsPage,
+        SpotifySavedTracksPage, SpotifySelectionOption, TidalReviewChoice, decision_from_choice,
         default_review_decisions_path, default_review_report_path, existing_review_cursor,
         format_duration, merge_unique_candidates, non_exact_track_lines, parse_concurrency,
         restore_source_order, selection_match_totals, spotify_offset_page_url, spotify_retry_delay,
@@ -2961,5 +3146,46 @@ mod tests {
     #[test]
     fn removes_terminal_control_characters() {
         assert_eq!(terminal_safe("Playlist\n\u{1b}[31m"), "Playlist  [31m");
+    }
+
+    #[test]
+    fn parses_single_invocation_migration_flags_and_rejects_conflicting_modes() {
+        let cli = Cli::try_parse_from([
+            "spotify-tidal-migrator",
+            "migrate",
+            "--concurrency",
+            "12",
+            "--rate-limit",
+            "4",
+            "--fallback-searches",
+            "--apply",
+            "--include-probable",
+            "--include-review",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Migrate {
+                concurrency,
+                rate_limit,
+                fallback_searches,
+                apply,
+                include_probable,
+                include_review,
+                ..
+            } => {
+                assert_eq!(concurrency, 12);
+                assert_eq!(rate_limit, Some(4.0));
+                assert!(fallback_searches);
+                assert!(apply);
+                assert!(include_probable);
+                assert!(include_review);
+            }
+            _ => panic!("expected migrate command"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["spotify-tidal-migrator", "migrate", "--dry-run", "--apply",])
+                .is_err()
+        );
     }
 }

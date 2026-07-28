@@ -6,10 +6,10 @@ Last revalidated: 2026-07-28
 
 Implementation status: the official create, add-items, and read-items operations
 are implemented behind an explicit `import-tidal --apply` safety gate. Dry-run
-is the default. A live third-party token successfully created a playlist, but
-the created identifier subsequently returned 404 from both read and add-items.
-The importer therefore persists that failure and never reports completion
-unless ordered read-back verification succeeds.
+is the default. A live third-party token successfully created a playlist. The
+test playlist was then manually deleted in the TIDAL app, which explains the
+subsequent 404 observed during read and add-items probes. The importer still
+never reports completion unless ordered read-back verification succeeds.
 
 ## Primary official sources
 
@@ -137,17 +137,15 @@ scope list contained `playlists.write` and not `w_usr` received HTTP 201 from
 `POST /playlists` on 2026-07-28. This proves creation was accepted for that
 request, but it does not explain the OpenAPI discrepancy.
 
-The new playlist ID then returned `NOT_FOUND` from:
+The test playlist ID later returned `NOT_FOUND` from:
 
 - `GET /playlists/{id}`
 - `POST /playlists/{id}/relationships/items`
-- `GET /playlists?filter[owners.id]=me` returned an empty page
 
-These observations are sanitized and intentionally do not include tokens,
-request Authorization headers, response dumps, or user playlist data. They may
-indicate ownership redaction or a service-side third-party authorization issue.
-Apply mode is implemented defensively around this condition and may remain
-blocked until TIDAL resolves it.
+The user confirmed that the playlist had been deleted manually in the TIDAL app
+before those probes. The 404 therefore does not indicate an ownership or scope
+failure. These observations are sanitized and intentionally do not include
+tokens, request Authorization headers, response dumps, or user playlist data.
 
 `TIDAL_SCOPES` remains user-configured. The importer requires the granted token
 to contain `playlists.write`; it does not hardcode or request internal `w_usr`.
@@ -185,6 +183,23 @@ the importer also uses read-back reconciliation to avoid re-adding a confirmed
 pending batch.
 
 ## CLI and generated files
+
+Single-invocation interactive flow:
+
+```bash
+cargo run -- migrate \
+  --concurrency 12 \
+  --rate-limit 4 \
+  --fallback-searches \
+  --apply \
+  --include-probable
+```
+
+This selects Spotify playlists or Liked Songs, exports them, matches them,
+optionally runs interactive Review when `--include-review` is supplied, and
+imports each successful source using its original Spotify name. Without
+`--apply`, the entire command stops at import-plan reports and makes no TIDAL
+mutation.
 
 Dry run:
 
